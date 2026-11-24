@@ -66,13 +66,18 @@ M DB가 재시작되므로 서비스가 중단됨. 진행 조회·취소는 `ha_
 | no | id | 하는 일 | 확인 | 되돌리기 |
 |---|---|---|---|---|
 | 1 | `convert_precheck` | DB가 싱글로 떠 있는지, 다른 DB 서버가 없는지, 노드 이름이 맞는지 | 실패하면 종료 | 없음 |
-| 2 | `convert_config` | cubrid.conf `ha_mode=on`·`force_remove_log_archives=no`. cubrid_ha.conf를 씀(`ha_port_id`, `ha_node_list=<ha_group>@<master_host>`, `ha_db_list=<db>`, `ha_copy_sync_mode=sync`). databases.txt 그 DB 줄 호스트를 `master_host`로 바꿈. 모두 `.bak.<uuid>` 남김 | 다시 읽어 확인 | `.bak` 복원 |
-| 3 | `convert_restart` | **서비스 중단 시작.** `cubrid server stop <db>`, cub_master 내림(`cub_commdb -A`), `cubrid heartbeat start` | 명령 출력 | heartbeat 멈춤, cub_master 내림, (설정 복원 뒤) `cubrid server start <db>`로 싱글 기동 |
-| 4 | `convert_verify` | `cubrid changemode <db>@localhost`가 active가 될 때까지 기다림(최대 180초). **서비스 중단 끝** | active | 3단계와 같음 |
+| 2 | `convert_stop` | **서비스 중단 시작.** `cubrid server stop <db>`(설정을 바꾸기 전에 함. `ha_mode=on`이 된 뒤에는 `cubrid server stop`이 "The server was configured for HA"로 거부함, 실측) | 명령 출력 | `cubrid server start <db>`로 싱글 기동 |
+| 3 | `convert_config` | cubrid.conf `ha_mode=on`·`force_remove_log_archives=no`. cubrid_ha.conf를 씀(`ha_port_id`, `ha_node_list=<ha_group>@<master_host>`, `ha_db_list=<db>`, `ha_copy_sync_mode=sync`). databases.txt 그 DB 줄 호스트를 `master_host`로 바꿈. 모두 `.bak.<uuid>` 남김 | 다시 읽어 확인 | `.bak` 복원 |
+| 4 | `convert_restart` | cub_master 내림(`cub_commdb -A`), `cubrid heartbeat start` | 명령 출력 | heartbeat 멈춤, cub_master 내림 |
+| 5 | `convert_verify` | `cubrid changemode <db>@localhost`가 active가 될 때까지 기다림(최대 180초). **서비스 중단 끝** | active | 없음 |
 
-- 상태 응답에 `downtime_sec`(DB를 멈춘 때부터 active가 된 때까지 걸린 초)를 넣음. 실측값은 시험 뒤 이 문서에 적음.
-- 이 작업 동안 M의 CMS는 계속 떠 있어야 함. 실측으로 확인함.
-- 브로커 설정은 바꾸지 않음. 응용이 접속하는 브로커와 databases.txt 호스트 열에 대한 영향은 실측 뒤 적음.
+- 상태 응답에 `downtime_sec`(DB를 멈춘 때부터 active가 된 때까지 걸린 초)를 넣음.
+- 실측(11.4.5.1908, 컨테이너, DB 64 MB):
+  - `downtime_sec` 14초.
+  - 이 동안 M의 CMS는 매초 응답함(재기동 영향 없음).
+  - 브로커(broker1)로 1초마다 보낸 SELECT는 2번(약 3초, DB를 멈춘 직후)만 실패함. heartbeat start로 서버가 뜬 뒤에는 active가 되기 전에도 SELECT가 성공함. 쓰기는 따로 재지 않음.
+- 브로커 설정은 바꾸지 않았고 브로커를 다시 띄울 필요도 없었음. databases.txt 호스트가 `localhost`에서 `master_host`로 바뀌어도 broker1은 그대로 붙음.
+- 실패하면 싱글로 되돌아감(실측: 2단계 실패 → 설정 복원 → `cubrid server start`로 싱글 기동, 약 4초).
 
 ## 1. `ha_check_ssh` — ssh 연결 확인 (동기, 최대 약 20초)
 

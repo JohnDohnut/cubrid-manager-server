@@ -1271,7 +1271,7 @@ namespace
     vector<edit_t> edits;
     vector<std::pair<string, string>> moved;	/* on NS */
     bool restored_new = false, ha_started = false, reloaded = false, repl_started = false, m_repl_dir_existed = true;
-    bool c_restarted = false;
+    bool c_stopped = false, c_restarted = false;
     time_t c_down_at = 0;
 
     /* shared with the status/cancel tasks, under mu */
@@ -1324,9 +1324,10 @@ namespace
   const char *CONVERT_STEPS[][2] =
   {
     {"convert_precheck", "Check the database"},
+    {"convert_stop", "Stop the database (service stops)"},
     {"convert_config", "Write the HA settings"},
-    {"convert_restart", "Restart the database under heartbeat (service stops)"},
-    {"convert_verify", "Check that the database is the active master"},
+    {"convert_restart", "Start the database under heartbeat"},
+    {"convert_verify", "Check that the database is the active master (service resumes)"},
   };
 
   void job_log (job_t *j, const string &line)
@@ -1930,25 +1931,34 @@ namespace
     return true;
   }
 
-  bool st_convert_restart (job_t *j, step_fail *f)
+  /* before the HA settings: once ha_mode=on, `cubrid server stop` refuses ("The server was configured for HA") */
+  bool st_convert_stop (job_t *j, step_fail *f)
   {
     j->c_down_at = time (NULL);
-    j->c_restarted = true;
+    j->c_stopped = true;
     save_state (j);
     job_log (j, "service interruption starts: " + j->db + " stops");
-    int rc = run_local (j, { bin (j, "cubrid"), "server", "stop", j->db }, NULL, 600);
-    if (rc != 0)
+    string out;
+    int rc = run_local (j, { bin (j, "cubrid"), "server", "stop", j->db }, &out, 600);
+    if (rc != 0 || out.find (": fail") != string::npos)
       {
 	f->exit_code = rc;
 	f->has_exit = rc > 0;
 	FAIL ("command_failed", "cubrid server stop " + j->db + " failed (" + std::to_string (rc) + ")");
       }
+    return true;
+  }
+
+  bool st_convert_restart (job_t *j, step_fail *f)
+  {
+    j->c_restarted = true;
+    save_state (j);
     if (!stop_local_cub_master (j))
       {
 	FAIL ("command_failed", "cub_master did not stop");
       }
     string out;
-    rc = run_local (j, { bin (j, "cubrid"), "heartbeat", "start" }, &out, 600);
+    int rc = run_local (j, { bin (j, "cubrid"), "heartbeat", "start" }, &out, 600);
     if (rc != 0 || out.find (": fail") != string::npos)
       {
 	f->exit_code = rc;
@@ -2693,7 +2703,7 @@ namespace
 
   bool has_undo (const string &id)
   {
-    static const char *ids[] = { "convert_config", "convert_restart", "slave_config", "master_backup", "send_backup",
+    static const char *ids[] = { "convert_stop", "convert_config", "convert_restart", "slave_config", "master_backup", "send_backup",
 				 "slave_keep_old_db", "slave_restore", "slave_copylog", "slave_ha_start", "master_config",
 				 "replication_start", "replica_config", "replica_replication_start", NULL
 			       };
@@ -2714,20 +2724,20 @@ namespace
     bool ok = true;
     if (id == "convert_restart" && j->c_restarted)
       {
-	/* back to a single database: heartbeat off, cub_master down; convert_config is undone next, then the
-	   database starts again without HA (in the convert_config undo) */
+	/* heartbeat off and cub_master down; then the settings come back (convert_config) and the database starts
+	   again without HA (convert_stop) */
 	run_local (j, { bin (j, "cubrid"), "heartbeat", "stop" }, NULL, 600);
 	ok = stop_local_cub_master (j);
       }
     else if (id == "convert_config")
       {
 	ok = restore_edits (j, -1);
-	if (j->c_restarted)
-	  {
-	    int rc = run_local (j, { bin (j, "cubrid"), "server", "start", j->db }, &out, 600);
-	    ok = rc == 0 && out.find (": fail") == string::npos && ok;
-	    job_log (j, string ("service interruption ends: ") + j->db + (ok ? " runs again without HA" : " did not start again"));
-	  }
+      }
+    else if (id == "convert_stop" && j->c_stopped)
+      {
+	int rc = run_local (j, { bin (j, "cubrid"), "server", "start", j->db }, &out, 600);
+	ok = rc == 0 && out.find (": fail") == string::npos;
+	job_log (j, string ("service interruption ends: ") + j->db + (ok ? " runs again without HA" : " did not start again"));
       }
     else if (id == "replica_replication_start")
       {
@@ -2866,7 +2876,7 @@ namespace
     vector<step_fn> fns;
     if (j->kind == "convert_master")
       {
-	fns = { st_convert_precheck, st_convert_config, st_convert_restart, st_convert_verify };
+	fns = { st_convert_precheck, st_convert_stop, st_convert_config, st_convert_restart, st_convert_verify };
       }
     else
       {
