@@ -1,5 +1,5 @@
 /*
- * HA slave POC: make this server an HA slave of a running master.
+ * HA slave POC, run on the master: convert a single database into an HA master, add a slave.
  * Tasks are described in docs/ha-make-slave-poc-api.md. Linux only.
  */
 
@@ -9,6 +9,7 @@
 #include <json/json.h>
 
 int ext_ha_check_ssh (Json::Value &request, Json::Value &response);
+int ext_ha_convert_master (Json::Value &request, Json::Value &response);
 int ext_ha_make_slave (Json::Value &request, Json::Value &response);
 int ext_ha_make_slave_status (Json::Value &request, Json::Value &response);
 int ext_ha_make_slave_cancel (Json::Value &request, Json::Value &response);

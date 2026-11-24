@@ -1,8 +1,9 @@
 /*
- * HA slave POC (plan 2 of the HA slave review): this CMS turns its own server into
- * an HA slave of a running master. Work on the master goes through libssh2 (command
- * execution and SFTP); work on this server runs locally. No ha_make_slavedb.sh, no
- * system ssh/scp. Tasks and steps: docs/ha-make-slave-poc-api.md.
+ * HA slave POC (plan 2 of the HA slave review), run on the master's CMS: it converts a single
+ * database here into an HA master, and makes a new server the slave of this master. Work on
+ * the new slave and the replicas goes through libssh2 (command execution and SFTP); work on
+ * this server runs locally. No ha_make_slavedb.sh, no system ssh/scp.
+ * Tasks and steps: docs/ha-make-slave-poc-api.md.
  *
  * The OS password lives only in memory (the request value is blanked on arrival,
  * the job copy is wiped when the job ends). It never goes to a command line, a log,
@@ -1136,9 +1137,94 @@ namespace
 	libssh2_sftp_close (f);
 	return ok;
       }
+
+      /* upload, continuing a partial remote file; false on error or cancel */
+      bool upload (const string &local, const string &remote, const std::atomic<bool> *cancel, string *msg)
+      {
+	if (!sftp_ready ())
+	  {
+	    *msg = "SFTP is not available: " + last_error ();
+	    return false;
+	  }
+	struct stat st;
+	if (stat (local.c_str (), &st) != 0)
+	  {
+	    *msg = "cannot read " + local + ": " + strerror (errno);
+	    return false;
+	  }
+	uint64_t size = (uint64_t) st.st_size, have = 0;
+	if (!stat_size (remote, &have) || have > size)
+	  {
+	    have = 0;
+	  }
+	if (have == size && size > 0)
+	  {
+	    return true;
+	  }
+	unsigned long flags = LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | (have == 0 ? LIBSSH2_FXF_TRUNC : 0);
+	LIBSSH2_SFTP_HANDLE *f = libssh2_sftp_open (sf, remote.c_str (), flags, LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR);
+	if (f == NULL)
+	  {
+	    *msg = "cannot write " + remote + ": " + last_error ();
+	    return false;
+	  }
+	if (have > 0)
+	  {
+	    libssh2_sftp_seek64 (f, have);
+	  }
+	int fd = open (local.c_str (), O_RDONLY);
+	if (fd < 0 || (have > 0 && lseek (fd, (off_t) have, SEEK_SET) < 0))
+	  {
+	    if (fd >= 0)
+	      {
+		::close (fd);
+	      }
+	    libssh2_sftp_close (f);
+	    *msg = "cannot read " + local + ": " + strerror (errno);
+	    return false;
+	  }
+	char buf[65536];
+	ssize_t n;
+	bool ok = true;
+	while (ok && (n = read (fd, buf, sizeof (buf))) > 0)
+	  {
+	    ssize_t off = 0;
+	    while (off < n)
+	      {
+		ssize_t w = libssh2_sftp_write (f, buf + off, n - off);
+		if (w <= 0)
+		  {
+		    *msg = "write failed on " + remote + ": " + last_error ();
+		    broken = true;
+		    ok = false;
+		    break;
+		  }
+		off += w;
+	      }
+	    if (ok && cancel != NULL && cancel->load ())
+	      {
+		*msg = "cancelled";
+		ok = false;
+	      }
+	  }
+	::close (fd);
+	if (libssh2_sftp_close (f) != 0 && ok)
+	  {
+	    *msg = "closing " + remote + " failed: " + last_error ();
+	    ok = false;
+	  }
+	return ok;
+      }
   };
 
   /* ------------------------------------------------------------ jobs */
+
+  /*
+   * Two kinds of job run on the master's (M) CMS:
+   *   convert_master: a single database on M becomes a one-node HA master (M restarts)
+   *   make_slave:     M is an HA master; a new server (NS) becomes its slave over ssh, replicas learn it over ssh
+   * Nodes: -1 this server (M), 0 the new slave (NS), k>0 replica k-1.
+   */
 
   struct step_t
   {
@@ -1147,12 +1233,11 @@ namespace
 
   struct edit_t
   {
-    int node;			/* -1 this server, 0 the master, k>0 replica k-1 */
+    int node;
     string path, bak;
     bool existed;
   };
 
-  /* a replica the new slave has to be added to (M-R -> M-S-R) */
   struct rep_t
   {
     string host, user, fp, pw;
@@ -1169,21 +1254,25 @@ namespace
   struct job_t
   {
     /* fixed after start */
-    string uuid, db, master, user, fp, slave, repl_home, m_bk_root, s_bk_root;
+    string kind, uuid, db, master, slave, user, fp, repl_home, m_bk_root, s_bk_root, ha_group, ha_port_id;
     int port = 22;
     bool start_ha = true;
     string cubrid, cubrid_dbs, local_version, state_dir;
 
     /* only the job thread touches these */
-    string pw;
-    ssh_conn ssh;
-    string m_copy_base, m_cubrid, m_dbs, m_version, m_node_list, m_port_id, m_db_list, m_sync_mode, m_replica_list, m_haconf;
+    string pw;			/* NS OS password */
+    ssh_conn ssh;		/* NS */
     vector<std::unique_ptr<rep_t>> reps;
+    string m_haconf, m_node_list, m_sync_mode, m_replica_list, m_copy_base;
     vector<string> m_db_line, s_db_line;
-    string m_bk_dir, s_bk_dir, repl_dir;
+    string s_cubrid, s_dbs, s_version, s_tmp;
+    bool s_master_running = false, s_master_stopped = false;
+    string m_bk_dir, s_bk_dir, s_repl_dir;
     vector<edit_t> edits;
-    vector<std::pair<string, string>> moved;
-    bool restored_new = false, repl_started = false, ha_started = false, reloaded = false, master_was_running = false, m_repl_dir_existed = true;
+    vector<std::pair<string, string>> moved;	/* on NS */
+    bool restored_new = false, ha_started = false, reloaded = false, repl_started = false, m_repl_dir_existed = true;
+    bool c_restarted = false;
+    time_t c_down_at = 0;
 
     /* shared with the status/cancel tasks, under mu */
     std::mutex mu;
@@ -1196,8 +1285,14 @@ namespace
     unsigned long long log_base = 0;
     vector<string> kept;
     time_t started = 0, ended = 0;
+    int downtime_sec = -1;
     std::atomic<bool> cancel {false};
     std::atomic<bool> rolling_back {false};	/* undo commands must not see the cancel */
+
+    ~job_t ()
+    {
+      wipe (pw);
+    }
   };
 
   std::mutex g_jobs_mu;
@@ -1205,27 +1300,34 @@ namespace
 
   const size_t LOG_MAX = 1024 * 1024;
 
-  const char *STEP_DEFS[][2] =
+  const char *MAKE_STEPS[][2] =
   {
-    {"precheck", "Check this server"},
-    {"connect", "Connect to the master over ssh"},
-    {"master_check", "Check the master"},
+    {"precheck", "Check this server (the master)"},
+    {"slave_connect", "Connect to the new slave over ssh"},
+    {"slave_check", "Check the new slave"},
     {"replica_check", "Connect to and check the replicas"},
-    {"slave_config", "Prepare this server's HA settings"},
-    {"master_backup", "Back up the master database online"},
-    {"fetch_backup", "Fetch the backup"},
-    {"keep_old_db", "Keep the old slave database aside"},
-    {"restore", "Restore as a slave"},
-    {"copylog", "First copy of the replication log"},
-    {"slave_ha_start", "Start HA on this server"},
-    {"master_config", "Add this server to the master's HA settings"},
-    {"replication_start", "Start replication on the master"},
-    {"replica_config", "Add this server to the replicas' HA settings"},
+    {"slave_config", "Prepare the new slave's HA settings"},
+    {"master_backup", "Back up the database online"},
+    {"send_backup", "Send the backup to the new slave"},
+    {"slave_keep_old_db", "Keep the new slave's old database aside"},
+    {"slave_restore", "Restore on the new slave"},
+    {"slave_copylog", "First copy of the replication log on the new slave"},
+    {"slave_ha_start", "Start HA on the new slave"},
+    {"master_config", "Add the new slave to this server's HA settings"},
+    {"replication_start", "Start replication on this server"},
+    {"replica_config", "Add the new slave to the replicas' HA settings"},
     {"replica_replication_start", "Start replication on the replicas"},
-    {"verify", "Check that this server is standby"},
+    {"verify", "Check that the new slave is standby"},
     {"cleanup", "Remove the backup files"},
   };
-  const int STEP_COUNT = sizeof (STEP_DEFS) / sizeof (STEP_DEFS[0]);
+
+  const char *CONVERT_STEPS[][2] =
+  {
+    {"convert_precheck", "Check the database"},
+    {"convert_config", "Write the HA settings"},
+    {"convert_restart", "Restart the database under heartbeat (service stops)"},
+    {"convert_verify", "Check that the database is the active master"},
+  };
 
   void job_log (job_t *j, const string &line)
   {
@@ -1243,6 +1345,7 @@ namespace
   {
     Json::Value v;
     v["uuid"] = j->uuid;
+    v["job_kind"] = j->kind;
     v["db_name"] = j->db;
     v["master_host"] = j->master;
     v["slave_host"] = j->slave;
@@ -1262,9 +1365,13 @@ namespace
       {
 	v["exit_code"] = j->exit_code;
       }
-    v["step_count"] = STEP_COUNT;
+    if (j->downtime_sec >= 0)
+      {
+	v["downtime_sec"] = j->downtime_sec;
+      }
+    v["step_count"] = (int) j->steps.size ();
     v["step_no"] = j->cur + 1;
-    v["step"] = (j->cur >= 0 && j->cur < STEP_COUNT) ? j->steps[j->cur].id : "";
+    v["step"] = (j->cur >= 0 && j->cur < (int) j->steps.size ()) ? j->steps[j->cur].id : "";
     Json::Value steps (Json::arrayValue);
     for (int i = 0; i < (int) j->steps.size (); i++)
       {
@@ -1286,6 +1393,11 @@ namespace
     return v;
   }
 
+  string node_label (job_t *j, int node)
+  {
+    return node < 0 ? string ("") : node == 0 ? "slave " + j->slave : "replica " + j->reps[node - 1]->host;
+  }
+
   void save_state (job_t *j)
   {
     Json::Value v;
@@ -1293,10 +1405,18 @@ namespace
       std::lock_guard<std::mutex> lg (j->mu);
       v = job_state_json (j);
     }
+    /* how to reach NS again (cleanup), without the password */
+    Json::Value ss;
+    ss["host"] = j->slave;
+    ss["port"] = j->port;
+    ss["os_user"] = j->user;
+    ss["hostkey_sha256"] = j->fp;
+    v["slave_ssh"] = ss;
     Json::Value moved (Json::arrayValue);
     for (auto &m : j->moved)
       {
 	Json::Value x;
+	x["node"] = "slave " + j->slave;
 	x["from"] = m.first;
 	x["to"] = m.second;
 	moved.append (x);
@@ -1306,7 +1426,7 @@ namespace
     for (auto &e : j->edits)
       {
 	Json::Value x;
-	x["node"] = e.node < 0 ? string ("slave") : e.node == 0 ? string ("master") : "replica " + j->reps[e.node - 1]->host;
+	x["node"] = e.node < 0 ? string ("master (this server)") : node_label (j, e.node);
 	x["path"] = e.path;
 	x["bak"] = e.existed ? e.bak : "";
 	edits.append (x);
@@ -1333,15 +1453,14 @@ namespace
     save_state (j);
   }
 
-  /* a failed step: what went wrong, for status */
   struct step_fail
   {
     string error, message;
-    int exit_code;
-    bool has_exit;
+    int exit_code = -1;
+    bool has_exit = false;
   };
 
-  /* ------------------------------------------------------------ local commands */
+  /* ------------------------------------------------------------ local commands (this server) */
 
   /*
    * run argv without a shell, as this CMS account; stdout+stderr go to the job log.
@@ -1450,7 +1569,12 @@ namespace
     return -1;
   }
 
-  /* a cub_master process of this user is running (argv element whose basename is cub_master) */
+  string bin (job_t *j, const char *name)
+  {
+    return j->cubrid + "/bin/" + name;
+  }
+
+  /* a cub_master of this account runs here (argv[0] basename "cub_master") */
   bool cub_master_running ()
   {
     DIR *d = opendir ("/proc");
@@ -1469,7 +1593,10 @@ namespace
 	string data;
 	bool ex = false;
 	read_local_file (string ("/proc/") + e->d_name + "/cmdline", &data, &ex);
-	for (const string &arg : split_any (data, string (1, '\0').c_str ()))
+	size_t z = data.find ('\0');
+	string a0 = z == string::npos ? data : data.substr (0, z);
+	string a1 = (z == string::npos) ? "" : data.substr (z + 1, data.find ('\0', z + 1) - z - 1);
+	for (const string &arg : { a0, a1 })	/* a1: under an emulator argv[0] is the emulator */
 	  {
 	    size_t sl = arg.rfind ('/');
 	    if ((sl == string::npos ? arg : arg.substr (sl + 1)) == "cub_master")
@@ -1479,7 +1606,6 @@ namespace
 		  {
 		    found = true;
 		  }
-		break;
 	      }
 	  }
       }
@@ -1487,21 +1613,41 @@ namespace
     return found;
   }
 
-  string bin (job_t *j, const char *name)
+  bool stop_local_cub_master (job_t *j)
   {
-    return j->cubrid + "/bin/" + name;
+    if (!cub_master_running ())
+      {
+	return true;
+      }
+    /* `cubrid master stop` is cub_commdb -A; this CMS is not a child of cub_master and keeps running */
+    run_local (j, { bin (j, "cub_commdb"), "-A" }, NULL, 120);
+    for (int i = 0; i < 30 && cub_master_running (); i++)
+      {
+	sleep (1);
+      }
+    return !cub_master_running ();
   }
 
-  /* ------------------------------------------------------------ remote helpers */
+  /* "Server <db> (rel ...)" lines of `cubrid server status` */
+  vector<string> running_servers (const string &status_out)
+  {
+    vector<string> out;
+    for (const string &l : lines_of (status_out))
+      {
+	vector<string> t = split_any (trim (l), " ");
+	if (t.size () >= 2 && t[0] == "Server")
+	  {
+	    out.push_back (t[1]);
+	  }
+      }
+    return out;
+  }
+
+  /* ------------------------------------------------------------ remote commands (NS, replicas) */
 
   ssh_conn &node_ssh (job_t *j, int node)
   {
     return node == 0 ? j->ssh : j->reps[node - 1]->ssh;
-  }
-
-  string node_label (job_t *j, int node)
-  {
-    return node < 0 ? string ("") : node == 0 ? string ("master") : "replica " + j->reps[node - 1]->host;
   }
 
   int remote_on (job_t *j, int node, const string &cmd, string *out, int timeout_sec)
@@ -1513,12 +1659,20 @@ namespace
     }, j->rolling_back.load () ? NULL : &j->cancel, timeout_sec);
   }
 
-  int remote (job_t *j, const string &cmd, string *out, int timeout_sec)
+  /*
+   * for commands that leave daemons behind (heartbeat start, cub_master): the daemon would hold the
+   * ssh channel open, so the output goes to a temporary file that is read back
+   */
+  int remote_daemon (job_t *j, int node, const string &cmd, string *out, int timeout_sec)
   {
-    return remote_on (j, 0, cmd, out, timeout_sec);
+    string wrapped = "f=$(mktemp) && { " + cmd + " ; } >\"$f\" 2>&1 </dev/null; rc=$?; cat \"$f\"; rm -f \"$f\"; exit $rc";
+    job_log (j, node_label (j, node) + "$ " + cmd);
+    return node_ssh (j, node).exec (wrapped, out, [j] (const string &l)
+    {
+      job_log (j, "  " + l);
+    }, j->rolling_back.load () ? NULL : &j->cancel, timeout_sec);
   }
 
-  /* connect (or check the connection) to a node: host key must still be the confirmed one */
   string login_node (job_t *j, int node, string *msg)
   {
     ssh_conn &c = node_ssh (j, node);
@@ -1526,7 +1680,7 @@ namespace
       {
 	return "";
       }
-    const string &host = node == 0 ? j->master : j->reps[node - 1]->host;
+    const string &host = node == 0 ? j->slave : j->reps[node - 1]->host;
     const string &user = node == 0 ? j->user : j->reps[node - 1]->user;
     const string &fp = node == 0 ? j->fp : j->reps[node - 1]->fp;
     const string &pw = node == 0 ? j->pw : j->reps[node - 1]->pw;
@@ -1559,12 +1713,24 @@ namespace
     return login_node (j, node, msg).empty ();
   }
 
-  bool reconnect (job_t *j, string *msg)
+  /* `cubrid ...` on any node: locally without a shell, remotely through the login shell */
+  int cubrid_on (job_t *j, int node, const vector<string> &args, string *out, int timeout_sec)
   {
-    return reconnect_node (j, 0, msg);
+    if (node < 0)
+      {
+	vector<string> argv = { bin (j, "cubrid") };
+	argv.insert (argv.end (), args.begin (), args.end ());
+	return run_local (j, argv, out, timeout_sec);
+      }
+    string cmd = "cubrid";
+    for (const string &a : args)
+      {
+	cmd += " " + shq (a);
+      }
+    return remote_on (j, node, cmd + " 2>&1", out, timeout_sec);
   }
 
-  /* edit one file (node -1 local, 0 master, k replica): keep path.bak.<uuid>, write the new content in place */
+  /* edit one file on a node: keep path.bak.<uuid>, write the new content in place */
   bool edit_file (job_t *j, int node, const string &path, const std::function<string (const string &)> &change,
 		  string *msg)
   {
@@ -1618,13 +1784,50 @@ namespace
     return true;
   }
 
+  bool read_on (job_t *j, int node, const string &path, string *data, bool *exists)
+  {
+    return node < 0 ? read_local_file (path, data, exists) : node_ssh (j, node).read_file (path, data, exists);
+  }
+
+  /* undo the edits a step made on one node (newest first) */
+  bool restore_edits (job_t *j, int node)
+  {
+    bool ok = true;
+    string msg;
+    if (node >= 0 && !reconnect_node (j, node, &msg))
+      {
+	job_log (j, msg);
+	return false;
+      }
+    for (auto it = j->edits.rbegin (); it != j->edits.rend (); ++it)
+      {
+	if (it->node != node)
+	  {
+	    continue;
+	  }
+	if (node >= 0)
+	  {
+	    string cmd = it->existed ? "mv -f " + shq (it->bak) + " " + shq (it->path) : "rm -f " + shq (it->path);
+	    ok = remote_on (j, node, cmd, NULL, 60) == 0 && ok;
+	  }
+	else if (it->existed)
+	  {
+	    ok = rename (it->bak.c_str (), it->path.c_str ()) == 0 && ok;
+	  }
+	else
+	  {
+	    ok = unlink (it->path.c_str ()) == 0 && ok;
+	  }
+	job_log (j, (node >= 0 ? node_label (j, node) + ": " : string ("")) + "restored " + it->path);
+      }
+    return ok;
+  }
+
   /* ------------------------------------------------------------ steps */
 
 #define FAIL(code, text) do { f->error = (code); f->message = (text); return false; } while (0)
 
-  bool add_slave_to_node (job_t *j, int node, const string &cubrid, const string &dbs, bool *reloaded, step_fail *f);
-
-  bool st_precheck (job_t *j, step_fail *f)
+  bool check_local_basics (job_t *j, step_fail *f)
   {
     if (j->cubrid.empty () || j->cubrid_dbs.empty ())
       {
@@ -1637,34 +1840,231 @@ namespace
       {
 	FAIL ("precheck_failed", "cannot read the local CUBRID version");
       }
-    out.clear ();
-    run_local (j, { bin (j, "cubrid"), "server", "status" }, &out, 60);
-    for (const string &l : lines_of (out))
+    if (local_hostname () != j->master)
       {
-	vector<string> t = split_any (trim (l), " ");
-	if (t.size () >= 2 && t[0] == "Server" && t[1] == j->db)
-	  {
-	    FAIL ("slave_db_running", "database " + j->db + " is running on this server; stop it first");
-	  }
-      }
-    if (j->start_ha)
-      {
-	string conf;
-	bool ex = false;
-	read_local_file (j->cubrid + "/conf/cubrid.conf", &conf, &ex);
-	if (conf_get (conf, "[common]", "ha_mode") != "on" && cub_master_running ())
-	  {
-	    FAIL ("precheck_failed", "cub_master is running on this server with HA off, so cubrid heartbeat start would fail. "
-		  "CMS cannot stop the service or cub_master (stopping the service stops CMS too). On this server run "
-		  "'cubrid service stop' and then 'cubrid manager start', and try again (or use start_ha=no)");
-	  }
+	FAIL ("precheck_failed", "master_host " + j->master + " is not this server's host name (" + local_hostname () + ")");
       }
     mkdir_p (j->state_dir);
-    job_log (j, "this server: " + j->slave + ", CUBRID " + j->local_version);
     return true;
   }
 
-  bool st_connect (job_t *j, step_fail *f)
+  /* -------- convert_master */
+
+  bool st_convert_precheck (job_t *j, step_fail *f)
+  {
+    if (!check_local_basics (j, f))
+      {
+	return false;
+      }
+    string conf, out;
+    bool ex = false;
+    read_local_file (j->cubrid + "/conf/cubrid.conf", &conf, &ex);
+    if (conf_get (conf, "[common]", "ha_mode") == "on" || conf_get (conf, "[common]", "ha_mode") == "yes")
+      {
+	FAIL ("already_ha", "ha_mode is already on in cubrid.conf");
+      }
+    run_local (j, { bin (j, "cubrid"), "server", "status" }, &out, 60);
+    vector<string> up = running_servers (out);
+    if (!contains (up, j->db))
+      {
+	FAIL ("precheck_failed", "database " + j->db + " is not running on this server");
+      }
+    vector<string> others;
+    for (const string &s : up)
+      {
+	if (s != j->db)
+	  {
+	    others.push_back (s);
+	  }
+      }
+    if (!others.empty ())
+      {
+	FAIL ("other_db_running", "other databases run on this server (" + join (others, ", ") +
+	      "); restarting cub_master in HA mode would stop them too. Stop them first and try again");
+      }
+    string dbtxt;
+    read_local_file (j->cubrid_dbs + "/databases.txt", &dbtxt, &ex);
+    j->m_db_line = dbtxt_line (dbtxt, j->db);
+    if (j->m_db_line.size () < 4)
+      {
+	FAIL ("precheck_failed", "databases.txt has no line for " + j->db);
+      }
+    job_log (j, "this server: " + j->master + ", CUBRID " + j->local_version + ", " + j->db + " runs without HA");
+    return true;
+  }
+
+  bool st_convert_config (job_t *j, step_fail *f)
+  {
+    string msg;
+    if (!edit_file (j, -1, j->cubrid + "/conf/cubrid.conf", [] (const string &c)
+    {
+      string n = conf_set (c, "[common]", "ha_mode", "on");
+      return conf_set (n, "[common]", "force_remove_log_archives", "no");
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    if (!edit_file (j, -1, j->cubrid + "/conf/cubrid_ha.conf", [j] (const string &c)
+    {
+      string n = conf_set (c, "[common]", "ha_port_id", j->ha_port_id);
+      n = conf_set (n, "[common]", "ha_node_list", j->ha_group + "@" + j->master);
+	n = conf_set (n, "[common]", "ha_db_list", j->db);
+	return conf_set (n, "[common]", "ha_copy_sync_mode", "sync");
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    if (!edit_file (j, -1, j->cubrid_dbs + "/databases.txt", [j] (const string &c)
+    {
+      vector<string> t = dbtxt_line (c, j->db);
+      if (t.size () < 4 || t[2] == j->master)
+	  {
+	    return c;
+	  }
+	t[2] = j->master;
+	return dbtxt_put (c, j->db, t);
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    return true;
+  }
+
+  bool st_convert_restart (job_t *j, step_fail *f)
+  {
+    j->c_down_at = time (NULL);
+    j->c_restarted = true;
+    save_state (j);
+    job_log (j, "service interruption starts: " + j->db + " stops");
+    int rc = run_local (j, { bin (j, "cubrid"), "server", "stop", j->db }, NULL, 600);
+    if (rc != 0)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL ("command_failed", "cubrid server stop " + j->db + " failed (" + std::to_string (rc) + ")");
+      }
+    if (!stop_local_cub_master (j))
+      {
+	FAIL ("command_failed", "cub_master did not stop");
+      }
+    string out;
+    rc = run_local (j, { bin (j, "cubrid"), "heartbeat", "start" }, &out, 600);
+    if (rc != 0 || out.find (": fail") != string::npos)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL ("command_failed", "cubrid heartbeat start failed");
+      }
+    return true;
+  }
+
+  bool st_convert_verify (job_t *j, step_fail *f)
+  {
+    string last;
+    for (int i = 0; i < 90; i++)
+      {
+	string out;
+	run_local (j, { bin (j, "cubrid"), "changemode", j->db + "@localhost" }, &out, 60);
+	last = trim (out);
+	if (out.find ("is active") != string::npos)
+	  {
+	    std::lock_guard<std::mutex> lg (j->mu);
+	    j->downtime_sec = (int) (time (NULL) - j->c_down_at);
+	    j->log += "[" + now_str () + "] service interruption ends: " + j->db + " is the active master after "
+		      + std::to_string (j->downtime_sec) + " s\n";
+	    return true;
+	  }
+	if (j->cancel.load ())
+	  {
+	    FAIL ("cancelled", "cancelled");
+	  }
+	sleep (2);
+      }
+    FAIL ("verify_failed", j->db + " did not become active: " + last);
+  }
+
+  /* -------- make_slave */
+
+  bool st_precheck (job_t *j, step_fail *f)
+  {
+    if (!check_local_basics (j, f))
+      {
+	return false;
+      }
+    string conf, ha, dbtxt, out;
+    bool ex = false;
+    read_local_file (j->cubrid + "/conf/cubrid.conf", &conf, &ex);
+    if (conf_get (conf, "[common]", "ha_mode") != "on")
+      {
+	FAIL ("master_not_ha", j->db + " is not an HA master here; convert it with ha_convert_master first");
+      }
+    run_local (j, { bin (j, "cubrid"), "changemode", j->db + "@localhost" }, &out, 60);
+    if (out.find ("is active") == string::npos)
+      {
+	FAIL ("master_not_active", "database " + j->db + " is not the active master: " + trim (out));
+      }
+    if (!read_local_file (j->cubrid + "/conf/cubrid_ha.conf", &ha, &ex) || !ex)
+      {
+	FAIL ("precheck_failed", "cannot read cubrid_ha.conf");
+      }
+    j->m_haconf = ha;
+    j->m_node_list = conf_get (ha, "[common]", "ha_node_list");
+    j->m_sync_mode = conf_get (ha, "[common]", "ha_copy_sync_mode");
+    j->m_replica_list = conf_get (ha, "[common]", "ha_replica_list");
+    j->m_copy_base = conf_get (ha, "[common]", "ha_copy_log_base");
+    if (j->m_copy_base.empty ())
+      {
+	j->m_copy_base = j->cubrid_dbs;
+      }
+    if (!contains (node_list_hosts (j->m_node_list), j->master))
+      {
+	FAIL ("precheck_failed", "ha_node_list (" + j->m_node_list + ") does not have " + j->master);
+      }
+    if (!contains (split_any (conf_get (ha, "[common]", "ha_db_list"), " ,:"), j->db))
+      {
+	FAIL ("precheck_failed", "ha_db_list does not have " + j->db);
+      }
+    if (contains (node_list_hosts (j->m_node_list), j->slave))
+      {
+	job_log (j, j->slave + " is already in ha_node_list; continuing (settings that are already there stay as they are)");
+      }
+    vector<string> mr = j->m_replica_list.empty () ? vector<string> () : node_list_hosts (j->m_replica_list);
+    vector<string> asked;
+    for (auto &r : j->reps)
+      {
+	asked.push_back (r->host);
+	if (!contains (mr, r->host))
+	  {
+	    FAIL ("precheck_failed", "replica " + r->host + " is not in ha_replica_list (" + j->m_replica_list + ")");
+	  }
+      }
+    for (const string &h : mr)
+      {
+	if (!contains (asked, h))
+	  {
+	    FAIL ("precheck_failed", "ha_replica_list has " + h + "; pass it in replicas so it learns the new slave too");
+	  }
+      }
+    read_local_file (j->cubrid_dbs + "/databases.txt", &dbtxt, &ex);
+    j->m_db_line = dbtxt_line (dbtxt, j->db);
+    if (j->m_db_line.size () < 4 || !valid_path (j->m_db_line[1]) || !valid_path (j->m_db_line[3]))
+      {
+	FAIL ("precheck_failed", "databases.txt has no usable line for " + j->db);
+      }
+    struct addrinfo hints, *res = NULL;
+    memset (&hints, 0, sizeof (hints));
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo (j->slave.c_str (), NULL, &hints, &res) != 0)
+      {
+	FAIL ("precheck_failed", "this server cannot resolve the new slave's name " + j->slave);
+      }
+    freeaddrinfo (res);
+    job_log (j, "this server: " + j->master + ", CUBRID " + j->local_version + ", " + j->db + " is the active master, ha_node_list="
+	     + j->m_node_list);
+    return true;
+  }
+
+  bool st_slave_connect (job_t *j, step_fail *f)
   {
     string msg;
     string err = login_node (j, 0, &msg);
@@ -1675,490 +2075,79 @@ namespace
     return true;
   }
 
-  bool st_master_check (job_t *j, step_fail *f)
+  bool st_slave_check (job_t *j, step_fail *f)
   {
-    string out;
-    int rc = remote (j, "echo \"CUBRID=$CUBRID\"; echo \"CUBRID_DATABASES=$CUBRID_DATABASES\"; "
-		     "echo \"HOSTNAME=$(uname -n)\"; \"$CUBRID/bin/cubrid_rel\" | grep -m1 CUBRID", &out, 60);
+    string out, hostname;
+    int rc = remote_on (j, 0, "echo \"CUBRID=$CUBRID\"; echo \"CUBRID_DATABASES=$CUBRID_DATABASES\"; "
+			"echo \"HOSTNAME=$(uname -n)\"; \"$CUBRID/bin/cubrid_rel\" | grep -m1 CUBRID; "
+			"getent hosts " + shq (j->master) + " >/dev/null && echo MASTER_RESOLVES", &out, 60);
+    bool resolves = false;
     for (const string &l : lines_of (out))
       {
 	if (l.compare (0, 7, "CUBRID=") == 0)
 	  {
-	    j->m_cubrid = l.substr (7);
+	    j->s_cubrid = l.substr (7);
 	  }
 	else if (l.compare (0, 17, "CUBRID_DATABASES=") == 0)
 	  {
-	    j->m_dbs = l.substr (17);
+	    j->s_dbs = l.substr (17);
 	  }
-	else if (l.find ("CUBRID ") == 0 && j->m_version.empty ())
+	else if (l.compare (0, 9, "HOSTNAME=") == 0)
 	  {
-	    j->m_version = parse_version (l);
+	    hostname = l.substr (9);
+	  }
+	else if (l == "MASTER_RESOLVES")
+	  {
+	    resolves = true;
+	  }
+	else if (l.find ("CUBRID ") == 0 && j->s_version.empty ())
+	  {
+	    j->s_version = parse_version (l);
 	  }
       }
-    if (rc != 0 || j->m_cubrid.empty () || j->m_version.empty ())
+    if (rc < 0 || j->s_cubrid.empty () || j->s_version.empty () || !valid_path (j->s_cubrid) || !valid_path (j->s_dbs))
       {
-	FAIL ("precheck_failed", "CUBRID was not found for " + j->user + " on the master");
+	FAIL ("precheck_failed", "slave " + j->slave + ": CUBRID was not found for " + j->user);
       }
-    if (j->m_version != j->local_version)
+    if (hostname != j->slave)
       {
-	FAIL ("version_mismatch", "master CUBRID " + j->m_version + ", this server " + j->local_version);
+	FAIL ("precheck_failed", "slave " + j->slave + ": its host name is " + hostname + "; slave_host must be the same");
+      }
+    if (j->s_version != j->local_version)
+      {
+	FAIL ("version_mismatch", "slave " + j->slave + ": CUBRID " + j->s_version + ", this server " + j->local_version);
+      }
+    if (!resolves)
+      {
+	FAIL ("precheck_failed", "slave " + j->slave + ": cannot resolve the master's name " + j->master);
       }
     out.clear ();
-    remote (j, "cubrid changemode " + shq (j->db + "@localhost") + " 2>&1", &out, 60);
-    if (out.find ("is active") == string::npos)
+    remote_on (j, 0, "cubrid server status 2>&1; for f in /proc/[0-9]*/cmdline; do c=$(tr '\\0' ' ' < $f 2>/dev/null); "
+	       "case \"$c\" in bash*|*-lc*) ;; cub_master*|*/bin/cub_master\\ *) echo CUB_MASTER_RUNNING;; esac; done", &out, 60);
+    vector<string> up = running_servers (out);
+    j->s_master_running = out.find ("CUB_MASTER_RUNNING") != string::npos;
+    if (contains (up, j->db))
       {
-	FAIL ("master_not_active", "database " + j->db + " is not active on the master: " + trim (out));
+	FAIL ("slave_db_running", "slave " + j->slave + ": database " + j->db + " is running there; stop it first");
       }
-    string ha, dbtxt;
-    bool ex1 = false, ex2 = false;
-    if (!j->ssh.read_file (j->m_cubrid + "/conf/cubrid_ha.conf", &ha, &ex1) || !ex1)
+    if (j->s_master_running && !up.empty () && j->start_ha)
       {
-	FAIL ("precheck_failed", "cannot read cubrid_ha.conf on the master");
+	FAIL ("other_db_running", "slave " + j->slave + ": other databases run there (" + join (up, ", ") +
+	      "); cub_master has to restart in HA mode, which would stop them. Stop them first and try again");
       }
-    j->m_node_list = conf_get (ha, "[common]", "ha_node_list");
-    j->m_port_id = conf_get (ha, "[common]", "ha_port_id");
-    j->m_db_list = conf_get (ha, "[common]", "ha_db_list");
-    j->m_sync_mode = conf_get (ha, "[common]", "ha_copy_sync_mode");
-    j->m_replica_list = conf_get (ha, "[common]", "ha_replica_list");
-    j->m_haconf = ha;
-    j->m_copy_base = conf_get (ha, "[common]", "ha_copy_log_base");
-    if (j->m_copy_base.empty ())
+    if (j->repl_home.empty ())
       {
-	j->m_copy_base = j->m_dbs;
+	j->repl_home = j->s_dbs;
       }
-    {
-      vector<string> mr = j->m_replica_list.empty () ? vector<string> () : node_list_hosts (j->m_replica_list);
-      vector<string> asked;
-      for (auto &r : j->reps)
-	{
-	  asked.push_back (r->host);
-	  if (!contains (mr, r->host))
-	    {
-	      FAIL ("precheck_failed", "replica " + r->host + " is not in the master's ha_replica_list (" + j->m_replica_list + ")");
-	    }
-	}
-      for (const string &h : mr)
-	{
-	  if (!contains (asked, h))
-	    {
-	      FAIL ("precheck_failed", "the master's ha_replica_list has " + h + "; pass it in replicas so it learns the new slave too");
-	    }
-	}
-    }
-    if (j->m_node_list.empty () || !contains (node_list_hosts (j->m_node_list), j->master))
+    if (j->s_bk_root.empty ())
       {
-	FAIL ("precheck_failed", "the master's ha_node_list (" + j->m_node_list + ") does not have " + j->master);
+	j->s_bk_root = j->s_dbs + "/ha_make_slave_backup";
       }
-    if (!contains (split_any (j->m_db_list, " ,:"), j->db))
+    if (!valid_path (j->repl_home) || !valid_path (j->s_bk_root))
       {
-	FAIL ("precheck_failed", "the master's ha_db_list (" + j->m_db_list + ") does not have " + j->db);
+	FAIL ("precheck_failed", "invalid repl_log_home or slave_backup_path");
       }
-    if (!j->ssh.read_file (j->m_dbs + "/databases.txt", &dbtxt, &ex2) || !ex2)
-      {
-	FAIL ("precheck_failed", "cannot read databases.txt on the master");
-      }
-    j->m_db_line = dbtxt_line (dbtxt, j->db);
-    if (j->m_db_line.size () < 4)
-      {
-	FAIL ("precheck_failed", "databases.txt on the master has no line for " + j->db);
-      }
-    if (j->m_bk_root.empty ())
-      {
-	j->m_bk_root = j->m_dbs + "/ha_make_slave_backup";
-      }
-    if (!valid_path (j->m_bk_root) || !valid_path (j->m_db_line[1]) || !valid_path (j->m_db_line[3]))
-      {
-	FAIL ("precheck_failed", "unexpected path on the master");
-      }
-    job_log (j, "master: CUBRID " + j->m_version + ", ha_node_list=" + j->m_node_list + ", " + j->db + " is active");
-    return true;
-  }
-
-  bool st_slave_config (job_t *j, step_fail *f)
-  {
-    string msg;
-    string conf = j->cubrid + "/conf/cubrid.conf";
-    if (!edit_file (j, -1, conf, [] (const string &c)
-    {
-      string n = conf_get (c, "[common]", "ha_mode") == "on" ? c : conf_set (c, "[common]", "ha_mode", "on");
-      /* manual (HA, adding a slave): keep logs that are not replicated yet */
-      return conf_get (n, "[common]", "force_remove_log_archives") == "no" ? n
-	     : conf_set (n, "[common]", "force_remove_log_archives", "no");
-      }, &msg))
-      {
-	FAIL ("config_edit_failed", msg);
-      }
-    string haconf = j->cubrid + "/conf/cubrid_ha.conf";
-    if (!edit_file (j, -1, haconf, [j] (const string &c)
-    {
-      bool ch;
-      string list = node_list_add (j->m_node_list, j->slave, &ch);
-	string dbl = conf_get (c, "[common]", "ha_db_list");
-	vector<string> dbs = split_any (dbl, " ,:");
-	if (!contains (dbs, j->db))
-	  {
-	    dbs.push_back (j->db);
-	  }
-	string n = conf_set (c, "[common]", "ha_mode", "on");
-	/* the rest of the HA settings as on the master (ha_port_id, ha_replica_list, ha_apply_max_mem_size, ...) */
-	for (auto &kv : conf_pairs (j->m_haconf, "[common]"))
-	  {
-	    if (kv.first != "ha_node_list" && kv.first != "ha_db_list" && kv.first != "ha_copy_sync_mode"
-		&& kv.first != "ha_copy_log_base")
-	      {
-		n = conf_set (n, "[common]", kv.first, kv.second);
-	      }
-	  }
-	n = conf_set (n, "[common]", "ha_node_list", list);
-	n = conf_set (n, "[common]", "ha_db_list", join (dbs, ","));
-	string sync = sync_mode_for (j->m_sync_mode, node_list_hosts (list).size ());
-	if (!sync.empty ())
-	  {
-	    n = conf_set (n, "[common]", "ha_copy_sync_mode", sync);
-	  }
-	if (j->repl_home != j->cubrid_dbs)
-	  {
-	    n = conf_set (n, "[common]", "ha_copy_log_base", j->repl_home);
-	  }
-	return n;
-      }, &msg))
-      {
-	FAIL ("config_edit_failed", msg);
-      }
-    string dbtxt_path = j->cubrid_dbs + "/databases.txt";
-    string dbtxt;
-    bool ex = false;
-    read_local_file (dbtxt_path, &dbtxt, &ex);
-    vector<string> cur = dbtxt_line (dbtxt, j->db);
-    vector<string> want = (cur.size () >= 4) ? cur : j->m_db_line;
-    vector<string> hosts = split_any (want[2], ":");
-    vector<string> ordered;
-    for (const string &h : node_list_hosts (j->m_node_list))
-      {
-	if (!contains (ordered, h))
-	  {
-	    ordered.push_back (h);
-	  }
-      }
-    if (!contains (ordered, j->slave))
-      {
-	ordered.push_back (j->slave);
-      }
-    for (const string &h : hosts)
-      {
-	if (!contains (ordered, h) && h != "localhost")
-	  {
-	    ordered.push_back (h);
-	  }
-      }
-    want[2] = join (ordered, ":");
-    if (!edit_file (j, -1, dbtxt_path, [&] (const string &c)
-    {
-      return dbtxt_line (c, j->db) == want ? c : dbtxt_put (c, j->db, want);
-      }, &msg))
-      {
-	FAIL ("config_edit_failed", msg);
-      }
-    j->s_db_line = want;
-    /* read back */
-    string c1, c2, c3;
-    bool e1, e2, e3;
-    read_local_file (conf, &c1, &e1);
-    read_local_file (haconf, &c2, &e2);
-    read_local_file (dbtxt_path, &c3, &e3);
-    if (conf_get (c1, "[common]", "ha_mode") != "on" || conf_get (c2, "[common]", "ha_node_list").empty ()
-	|| dbtxt_line (c3, j->db) != want)
-      {
-	FAIL ("config_edit_failed", "the settings did not read back as written");
-      }
-    if (!valid_path (want[1]) || !valid_path (want[3]))
-      {
-	FAIL ("precheck_failed", "unexpected volume or log path for " + j->db);
-      }
-    job_log (j, "this server: ha_node_list=" + conf_get (c2, "[common]", "ha_node_list") + ", " + j->db + " -> " + want[1]);
-    return true;
-  }
-
-  bool st_master_backup (job_t *j, step_fail *f)
-  {
-    j->m_bk_dir = j->m_bk_root + "/" + j->uuid;
-    save_state (j);
-    string dir = shq (j->m_bk_dir);
-    int rc = remote (j, "mkdir -p " + dir + " && cubrid backupdb -C -D " + dir + " -o " + shq (j->m_bk_dir + "/backup.out")
-		     + " --no-check " + shq (j->db + "@localhost") + " 2>&1", NULL, 6 * 3600);
-    if (rc != 0)
-      {
-	f->exit_code = rc;
-	f->has_exit = rc > 0;
-	FAIL (rc == -2 ? "cancelled" : "command_failed", "cubrid backupdb on the master failed (" + std::to_string (rc) + ")");
-      }
-    return true;
-  }
-
-  bool st_fetch_backup (job_t *j, step_fail *f)
-  {
-    j->s_bk_dir = j->s_bk_root + "/" + j->uuid;
-    save_state (j);
-    if (!mkdir_p (j->s_bk_dir))
-      {
-	FAIL ("transfer_failed", "cannot create " + j->s_bk_dir);
-      }
-    vector<std::pair<string, uint64_t>> files;
-    if (!j->ssh.list_files (j->m_bk_dir, &files))
-      {
-	FAIL ("transfer_failed", "cannot list " + j->m_bk_dir + " on the master");
-      }
-    vector<std::pair<string, string>> todo;	/* remote path, local name */
-    for (auto &fi : files)
-      {
-	if (fi.first != "backup.out")
-	  {
-	    todo.push_back (std::make_pair (j->m_bk_dir + "/" + fi.first, fi.first));
-	  }
-      }
-    string bkvinf = j->db + "_bkvinf";
-    todo.push_back (std::make_pair (j->m_db_line[3] + "/" + bkvinf, bkvinf));
-    string sums_cmd = "sha256sum";
-    for (auto &t : todo)
-      {
-	sums_cmd += " " + shq (t.first);
-      }
-    string sums;
-    if (remote (j, sums_cmd, &sums, 3600) != 0)
-      {
-	FAIL ("transfer_failed", "sha256sum on the master failed");
-      }
-    for (auto &t : todo)
-      {
-	string want;
-	for (const string &l : lines_of (sums))
-	  {
-	    size_t sp = l.find ("  ");
-	    if (sp != string::npos && l.substr (sp + 2) == t.first)
-	      {
-		want = l.substr (0, sp);
-	      }
-	  }
-	uint64_t size = 0;
-	if (want.empty () || !j->ssh.stat_size (t.first, &size))
-	  {
-	    FAIL ("transfer_failed", "cannot read size or checksum of " + t.first);
-	  }
-	string local = j->s_bk_dir + "/" + t.second, msg;
-	bool ok = false;
-	for (int attempt = 1; attempt <= 3 && !ok; attempt++)
-	  {
-	    if (j->cancel.load ())
-	      {
-		FAIL ("cancelled", "cancelled");
-	      }
-	    if (!reconnect (j, &msg))
-	      {
-		continue;
-	      }
-	    ok = j->ssh.download (t.first, local, size, &j->cancel, &msg);
-	    if (!ok)
-	      {
-		job_log (j, "transfer of " + t.second + " stopped (" + msg + "), attempt " + std::to_string (attempt));
-		j->ssh.close ();
-	      }
-	  }
-	if (!ok)
-	  {
-	    FAIL (j->cancel.load () ? "cancelled" : "transfer_failed", msg);
-	  }
-	struct stat st;
-	string got;
-	if (stat (local.c_str (), &st) != 0 || (uint64_t) st.st_size != size || !sha256_local (local, &got) || got != want)
-	  {
-	    FAIL ("transfer_failed", "size or checksum of " + t.second + " does not match the master");
-	  }
-	job_log (j, "received " + t.second + " (" + std::to_string (size) + " bytes, sha256 ok)");
-      }
-    return true;
-  }
-
-  bool st_keep_old_db (job_t *j, step_fail *f)
-  {
-    vector<string> paths;
-    paths.push_back (j->s_db_line[1]);
-    if (j->s_db_line[3] != j->s_db_line[1])
-      {
-	paths.push_back (j->s_db_line[3]);
-      }
-    DIR *d = opendir (j->repl_home.c_str ());
-    if (d != NULL)
-      {
-	struct dirent *e;
-	string prefix = j->db + "_";
-	while ((e = readdir (d)) != NULL)
-	  {
-	    string n = e->d_name;
-	    if (n.compare (0, prefix.size (), prefix) == 0 && n.find (".ha_make_slave_") == string::npos
-		&& is_dir (j->repl_home + "/" + n))
-	      {
-		paths.push_back (j->repl_home + "/" + n);
-	      }
-	  }
-	closedir (d);
-      }
-    for (const string &p : paths)
-      {
-	if (!is_dir (p) || !dir_has_entries (p))
-	  {
-	    continue;
-	  }
-	string to = p + ".ha_make_slave_" + j->uuid;
-	if (rename (p.c_str (), to.c_str ()) != 0)
-	  {
-	    FAIL ("command_failed", "cannot move " + p + ": " + strerror (errno));
-	  }
-	j->moved.push_back (std::make_pair (p, to));
-	{
-	  std::lock_guard<std::mutex> lg (j->mu);
-	  j->kept.push_back (to);
-	}
-	save_state (j);
-	job_log (j, "kept " + p + " as " + to);
-      }
-    if (j->moved.empty ())
-      {
-	job_log (j, "no old database files on this server");
-      }
-    if (!mkdir_p (j->s_db_line[1]) || !mkdir_p (j->s_db_line[3]))
-      {
-	FAIL ("command_failed", "cannot create the database folders");
-      }
-    return true;
-  }
-
-  bool st_restore (job_t *j, step_fail *f)
-  {
-    string bkvinf = j->db + "_bkvinf";
-    string data;
-    bool ex = false;
-    read_local_file (j->s_bk_dir + "/" + bkvinf, &data, &ex);
-    if (!ex || !write_local_file (j->s_db_line[3] + "/" + bkvinf, data))
-      {
-	FAIL ("command_failed", "cannot place " + bkvinf);
-      }
-    j->restored_new = true;
-    save_state (j);
-    int rc = run_local (j, { bin (j, "cubrid"), "restoreslave", "-s", "master", "-m", j->master, "-B", j->s_bk_dir, j->db },
-			NULL, 6 * 3600);
-    if (rc != 0)
-      {
-	f->exit_code = rc;
-	f->has_exit = rc > 0;
-	FAIL (rc == -2 ? "cancelled" : "command_failed", "cubrid restoreslave failed (" + std::to_string (rc) + ")");
-      }
-    return true;
-  }
-
-  bool st_copylog (job_t *j, step_fail *f)
-  {
-    j->repl_dir = j->repl_home + "/" + j->db + "_" + j->master;
-    save_state (j);
-    remove_tree (j->repl_dir);
-    if (!mkdir_p (j->repl_dir))
-      {
-	FAIL ("command_failed", "cannot create " + j->repl_dir);
-      }
-    int rc = run_local (j, { bin (j, "cub_admin"), "copylogdb", "-L", j->repl_dir, "-m", "async", "--start-page-id=-1",
-			     j->db + "@" + j->master
-			   }, NULL, 3600);
-    if (rc != 0)
-      {
-	f->exit_code = rc;
-	f->has_exit = rc > 0;
-	FAIL (rc == -2 ? "cancelled" : "command_failed", "copylogdb failed (" + std::to_string (rc) + ")");
-      }
-    return true;
-  }
-
-  bool st_master_config (job_t *j, step_fail *f)
-  {
-    return add_slave_to_node (j, 0, j->m_cubrid, j->m_dbs, &j->reloaded, f);
-  }
-
-  /* the folder `replication start <slave>` copies the slave's log into on that node */
-  string slave_log_dir (job_t *j, const string &copy_base)
-  {
-    return copy_base + "/" + j->db + "_" + j->slave;
-  }
-
-  bool remote_dir_exists (job_t *j, int node, const string &dir)
-  {
-    string out;
-    remote_on (j, node, "test -d " + shq (dir) + " && echo exists || echo none", &out, 30);
-    return out.find ("exists") != string::npos;
-  }
-
-  bool st_replication_start (job_t *j, step_fail *f)
-  {
-    string out;
-    j->m_repl_dir_existed = remote_dir_exists (j, 0, slave_log_dir (j, j->m_copy_base));
-    j->repl_started = true;
-    save_state (j);
-    int rc = remote (j, "cubrid heartbeat replication start " + shq (j->slave) + " 2>&1", &out, 300);
-    if (rc != 0 || out.find ("fail") != string::npos)
-      {
-	f->exit_code = rc;
-	f->has_exit = rc > 0;
-	FAIL ("command_failed", "cubrid heartbeat replication start on the master failed: " + trim (out));
-      }
-    return true;
-  }
-
-  bool st_slave_ha_start (job_t *j, step_fail *f)
-  {
-    string out;
-    j->master_was_running = cub_master_running ();
-    j->ha_started = true;
-    save_state (j);
-    int rc = run_local (j, { bin (j, "cubrid"), "heartbeat", "start", j->db }, &out, 600);
-    if (rc != 0 || out.find ("fail") != string::npos)
-      {
-	f->exit_code = rc;
-	f->has_exit = rc > 0;
-	FAIL (rc == -2 ? "cancelled" : "command_failed", "cubrid heartbeat start " + j->db + " failed");
-      }
-    return true;
-  }
-
-  bool st_verify (job_t *j, step_fail *f)
-  {
-    string last;
-    for (int i = 0; i < 40; i++)
-      {
-	string out;
-	run_local (j, { bin (j, "cubrid"), "changemode", j->db + "@localhost" }, &out, 60);
-	last = trim (out);
-	if (out.find ("is standby") != string::npos)
-	  {
-	    return true;
-	  }
-	if (j->cancel.load ())
-	  {
-	    FAIL ("cancelled", "cancelled");
-	  }
-	sleep (3);
-      }
-    FAIL ("verify_failed", "this server did not become standby: " + last);
-  }
-
-  bool st_cleanup (job_t *j, step_fail *f)
-  {
-    string msg;
-    if (!j->m_bk_dir.empty () && reconnect (j, &msg))
-      {
-	remote (j, "rm -rf " + shq (j->m_bk_dir), NULL, 600);
-      }
-    if (!j->s_bk_dir.empty ())
-      {
-	remove_tree (j->s_bk_dir);
-	job_log (j, "removed " + j->s_bk_dir);
-      }
+    job_log (j, "slave " + j->slave + ": CUBRID " + j->s_version + (j->s_master_running ? ", cub_master runs" : ", no cub_master"));
     return true;
   }
 
@@ -2199,28 +2188,28 @@ namespace
 	  }
 	if (rc != 0 || r->cubrid.empty () || r->version.empty ())
 	  {
-	    FAIL ("precheck_failed", "CUBRID was not found for " + r->user + " on replica " + r->host);
+	    FAIL ("precheck_failed", "replica " + r->host + ": CUBRID was not found for " + r->user);
 	  }
 	if (r->version != j->local_version)
 	  {
-	    FAIL ("version_mismatch", "replica " + r->host + " CUBRID " + r->version + ", this server " + j->local_version);
+	    FAIL ("version_mismatch", "replica " + r->host + ": CUBRID " + r->version + ", this server " + j->local_version);
 	  }
 	out.clear ();
 	remote_on (j, node, "cubrid changemode " + shq (j->db + "@localhost") + " 2>&1", &out, 60);
 	if (out.find ("is standby") == string::npos)
 	  {
-	    FAIL ("precheck_failed", "database " + j->db + " on replica " + r->host + " is not running as standby: " + trim (out));
+	    FAIL ("precheck_failed", "replica " + r->host + ": " + j->db + " is not running as standby: " + trim (out));
 	  }
 	string ha;
 	bool ex = false;
 	if (!r->ssh.read_file (r->cubrid + "/conf/cubrid_ha.conf", &ha, &ex) || !ex)
 	  {
-	    FAIL ("precheck_failed", "cannot read cubrid_ha.conf on replica " + r->host);
+	    FAIL ("precheck_failed", "replica " + r->host + ": cannot read cubrid_ha.conf");
 	  }
 	if (!contains (split_any (conf_get (ha, "[common]", "ha_db_list"), " ,:"), j->db)
 	    || !contains (node_list_hosts (conf_get (ha, "[common]", "ha_node_list")), j->master))
 	  {
-	    FAIL ("precheck_failed", "replica " + r->host + " is not replicating " + j->db + " from " + j->master);
+	    FAIL ("precheck_failed", "replica " + r->host + ": not replicating " + j->db + " from " + j->master);
 	  }
 	r->copy_base = conf_get (ha, "[common]", "ha_copy_log_base");
 	if (r->copy_base.empty ())
@@ -2232,11 +2221,312 @@ namespace
     return true;
   }
 
-  /* procedure 6 and 8 on one remote node (master or a replica): ha_node_list (+ ha_copy_sync_mode), databases.txt, reload */
+  bool st_slave_config (job_t *j, step_fail *f)
+  {
+    string msg;
+    string conf = j->s_cubrid + "/conf/cubrid.conf";
+    if (!edit_file (j, 0, conf, [] (const string &c)
+    {
+      string n = conf_get (c, "[common]", "ha_mode") == "on" ? c : conf_set (c, "[common]", "ha_mode", "on");
+      /* manual (HA, adding a slave): keep logs that are not replicated yet */
+      return conf_get (n, "[common]", "force_remove_log_archives") == "no" ? n
+	     : conf_set (n, "[common]", "force_remove_log_archives", "no");
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    string haconf = j->s_cubrid + "/conf/cubrid_ha.conf";
+    bool ch;
+    string list = node_list_add (j->m_node_list, j->slave, &ch);
+    if (!edit_file (j, 0, haconf, [j, list] (const string &c)
+    {
+      string n = conf_set (c, "[common]", "ha_mode", "on");
+      /* the HA settings as on the master (ha_port_id, ha_replica_list, ha_apply_max_mem_size, ...) */
+      for (auto &kv : conf_pairs (j->m_haconf, "[common]"))
+	  {
+	    if (kv.first != "ha_node_list" && kv.first != "ha_db_list" && kv.first != "ha_copy_sync_mode"
+		&& kv.first != "ha_copy_log_base")
+	      {
+		n = conf_set (n, "[common]", kv.first, kv.second);
+	      }
+	  }
+	vector<string> dbs = split_any (conf_get (c, "[common]", "ha_db_list"), " ,:");
+	if (!contains (dbs, j->db))
+	  {
+	    dbs.push_back (j->db);
+	  }
+	n = conf_set (n, "[common]", "ha_node_list", list);
+	n = conf_set (n, "[common]", "ha_db_list", join (dbs, ","));
+	string sync = sync_mode_for (j->m_sync_mode, node_list_hosts (list).size ());
+	if (!sync.empty ())
+	  {
+	    n = conf_set (n, "[common]", "ha_copy_sync_mode", sync);
+	  }
+	if (j->repl_home != j->s_dbs)
+	  {
+	    n = conf_set (n, "[common]", "ha_copy_log_base", j->repl_home);
+	  }
+	return n;
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    string dbtxt_path = j->s_dbs + "/databases.txt", dbtxt;
+    bool ex = false;
+    j->ssh.read_file (dbtxt_path, &dbtxt, &ex);
+    vector<string> cur = dbtxt_line (dbtxt, j->db);
+    vector<string> want = (cur.size () >= 4) ? cur : j->m_db_line;
+    vector<string> ordered;
+    for (const string &h : node_list_hosts (list))
+      {
+	if (!contains (ordered, h))
+	  {
+	    ordered.push_back (h);
+	  }
+      }
+    for (const string &h : split_any (want[2], ":"))
+      {
+	if (!contains (ordered, h) && h != "localhost")
+	  {
+	    ordered.push_back (h);
+	  }
+      }
+    want[2] = join (ordered, ":");
+    if (!valid_path (want[1]) || !valid_path (want[3]))
+      {
+	FAIL ("precheck_failed", "unexpected volume or log path for " + j->db);
+      }
+    if (!edit_file (j, 0, dbtxt_path, [&] (const string &c)
+    {
+      return dbtxt_line (c, j->db) == want ? c : dbtxt_put (c, j->db, want);
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    j->s_db_line = want;
+    string c1, c2, c3;
+    bool e1, e2, e3;
+    j->ssh.read_file (conf, &c1, &e1);
+    j->ssh.read_file (haconf, &c2, &e2);
+    j->ssh.read_file (dbtxt_path, &c3, &e3);
+    if (conf_get (c1, "[common]", "ha_mode") != "on" || conf_get (c2, "[common]", "ha_node_list") != list
+	|| dbtxt_line (c3, j->db) != want)
+      {
+	FAIL ("config_edit_failed", "slave " + j->slave + ": the settings did not read back as written");
+      }
+    job_log (j, "slave " + j->slave + ": ha_node_list=" + list + ", " + j->db + " -> " + want[1]);
+    return true;
+  }
+
+  bool st_master_backup (job_t *j, step_fail *f)
+  {
+    j->m_bk_dir = j->m_bk_root + "/" + j->uuid;
+    save_state (j);
+    if (!mkdir_p (j->m_bk_dir))
+      {
+	FAIL ("command_failed", "cannot create " + j->m_bk_dir);
+      }
+    int rc = run_local (j, { bin (j, "cubrid"), "backupdb", "-C", "-D", j->m_bk_dir, "-o", j->m_bk_dir + "/backup.out",
+			     "--no-check", j->db + "@localhost"
+			   }, NULL, 6 * 3600);
+    if (rc != 0)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL (rc == -2 ? "cancelled" : "command_failed", "cubrid backupdb failed (" + std::to_string (rc) + ")");
+      }
+    return true;
+  }
+
+  bool st_send_backup (job_t *j, step_fail *f)
+  {
+    j->s_bk_dir = j->s_bk_root + "/" + j->uuid;
+    save_state (j);
+    string msg;
+    if (remote_on (j, 0, "mkdir -p " + shq (j->s_bk_dir), NULL, 60) != 0)
+      {
+	FAIL ("transfer_failed", "slave " + j->slave + ": cannot create " + j->s_bk_dir);
+      }
+    vector<std::pair<string, string>> todo;	/* local path, remote name */
+    DIR *d = opendir (j->m_bk_dir.c_str ());
+    if (d != NULL)
+      {
+	struct dirent *e;
+	while ((e = readdir (d)) != NULL)
+	  {
+	    string n = e->d_name;
+	    if (n != "." && n != ".." && n != "backup.out")
+	      {
+		todo.push_back (std::make_pair (j->m_bk_dir + "/" + n, n));
+	      }
+	  }
+	closedir (d);
+      }
+    string bkvinf = j->db + "_bkvinf";
+    todo.push_back (std::make_pair (j->m_db_line[3] + "/" + bkvinf, bkvinf));
+    string names;
+    for (auto &t : todo)
+      {
+	string sum;
+	if (!sha256_local (t.first, &sum))
+	  {
+	    FAIL ("transfer_failed", "cannot read " + t.first);
+	  }
+	string remote = j->s_bk_dir + "/" + t.second;
+	bool ok = false;
+	for (int attempt = 1; attempt <= 3 && !ok; attempt++)
+	  {
+	    if (j->cancel.load ())
+	      {
+		FAIL ("cancelled", "cancelled");
+	      }
+	    if (!reconnect_node (j, 0, &msg))
+	      {
+		continue;
+	      }
+	    ok = j->ssh.upload (t.first, remote, &j->cancel, &msg);
+	    if (!ok)
+	      {
+		job_log (j, "sending " + t.second + " stopped (" + msg + "), attempt " + std::to_string (attempt));
+		j->ssh.close ();
+	      }
+	  }
+	if (!ok)
+	  {
+	    FAIL (j->cancel.load () ? "cancelled" : "transfer_failed", "slave " + j->slave + ": " + msg);
+	  }
+	string out;
+	remote_on (j, 0, "sha256sum " + shq (remote), &out, 3600);
+	struct stat st;
+	uint64_t rsize = 0;
+	if (out.compare (0, sum.size (), sum) != 0 || stat (t.first.c_str (), &st) != 0 || !j->ssh.stat_size (remote, &rsize)
+	    || rsize != (uint64_t) st.st_size)
+	  {
+	    FAIL ("transfer_failed", "slave " + j->slave + ": size or checksum of " + t.second + " does not match");
+	  }
+	job_log (j, "sent " + t.second + " (" + std::to_string (rsize) + " bytes, sha256 ok)");
+      }
+    return true;
+  }
+
+  bool st_slave_keep_old_db (job_t *j, step_fail *f)
+  {
+    vector<string> paths = { j->s_db_line[1] };
+    if (j->s_db_line[3] != j->s_db_line[1])
+      {
+	paths.push_back (j->s_db_line[3]);
+      }
+    string suffix = ".ha_make_slave_" + j->uuid;
+    string cmd;
+    for (const string &p : paths)
+      {
+	cmd += "if [ -d " + shq (p) + " ] && [ -n \"$(ls -A " + shq (p) + ")\" ]; then mv " + shq (p) + " " + shq (p + suffix)
+	       + " && echo MOVED " + p + "; fi; ";
+      }
+    cmd += "for d in " + shq (j->repl_home) + "/" + j->db + "_*; do case \"$d\" in *.ha_make_slave_*) continue;; esac; "
+	   "[ -d \"$d\" ] && mv \"$d\" \"$d" + suffix + "\" && echo MOVED $d; done; "
+	   "mkdir -p " + shq (j->s_db_line[1]) + " " + shq (j->s_db_line[3]);
+    string out;
+    int rc = remote_on (j, 0, cmd, &out, 600);
+    for (const string &l : lines_of (out))
+      {
+	if (l.compare (0, 6, "MOVED ") == 0)
+	  {
+	    string from = l.substr (6);
+	    j->moved.push_back (std::make_pair (from, from + suffix));
+	    std::lock_guard<std::mutex> lg (j->mu);
+	    j->kept.push_back (from + suffix);
+	  }
+      }
+    save_state (j);
+    if (rc != 0)
+      {
+	FAIL ("command_failed", "slave " + j->slave + ": moving the old database aside failed");
+      }
+    if (j->moved.empty ())
+      {
+	job_log (j, "no old database files on the new slave");
+      }
+    return true;
+  }
+
+  bool st_slave_restore (job_t *j, step_fail *f)
+  {
+    j->restored_new = true;
+    save_state (j);
+    string bkvinf = j->db + "_bkvinf";
+    int rc = remote_on (j, 0, "cp -f " + shq (j->s_bk_dir + "/" + bkvinf) + " " + shq (j->s_db_line[3] + "/") +
+			" && cubrid restoreslave -s master -m " + shq (j->master) + " -B " + shq (j->s_bk_dir) + " " + shq (j->db)
+			+ " 2>&1", NULL, 6 * 3600);
+    if (rc != 0)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL (rc == -2 ? "cancelled" : "command_failed", "slave " + j->slave + ": cubrid restoreslave failed (" + std::to_string (rc) + ")");
+      }
+    return true;
+  }
+
+  bool st_slave_copylog (job_t *j, step_fail *f)
+  {
+    j->s_repl_dir = j->repl_home + "/" + j->db + "_" + j->master;
+    save_state (j);
+    int rc = remote_on (j, 0, "rm -rf " + shq (j->s_repl_dir) + " && mkdir -p " + shq (j->s_repl_dir) +
+			" && cub_admin copylogdb -L " + shq (j->s_repl_dir) + " -m async --start-page-id=-1 " +
+			shq (j->db + "@" + j->master) + " 2>&1", NULL, 3600);
+    if (rc != 0)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL (rc == -2 ? "cancelled" : "command_failed", "slave " + j->slave + ": copylogdb failed (" + std::to_string (rc) + ")");
+      }
+    return true;
+  }
+
+  string remote_master_check_cmd ()
+  {
+    return "for f in /proc/[0-9]*/cmdline; do c=$(tr '\\0' ' ' < $f 2>/dev/null); "
+	   "case \"$c\" in bash*|*-lc*) ;; cub_master*|*/bin/cub_master\\ *) echo CUB_MASTER_RUNNING;; esac; done";
+  }
+
+  bool slave_master_running (job_t *j)
+  {
+    string out;
+    remote_on (j, 0, remote_master_check_cmd (), &out, 60);
+    return out.find ("CUB_MASTER_RUNNING") != string::npos;
+  }
+
+  bool st_slave_ha_start (job_t *j, step_fail *f)
+  {
+    if (j->s_master_running)
+      {
+	/* checked in slave_check: no database server runs there, so only cub_master goes down */
+	j->s_master_stopped = true;
+	save_state (j);
+	remote_on (j, 0, "cub_commdb -A 2>&1", NULL, 120);
+	for (int i = 0; i < 30 && slave_master_running (j); i++)
+	  {
+	    sleep (1);
+	  }
+      }
+    j->ha_started = true;
+    save_state (j);
+    string out;
+    int rc = remote_daemon (j, 0, "cubrid heartbeat start " + shq (j->db), &out, 600);
+    if (rc != 0 || out.find (": fail") != string::npos)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL (rc == -2 ? "cancelled" : "command_failed", "slave " + j->slave + ": cubrid heartbeat start " + j->db + " failed");
+      }
+    return true;
+  }
+
+  /* procedure 6 and 8 on an existing node (this server or a replica): ha_node_list (+ ha_copy_sync_mode), databases.txt, reload */
   bool add_slave_to_node (job_t *j, int node, const string &cubrid, const string &dbs, bool *reloaded, step_fail *f)
   {
     string msg;
-    if (!reconnect_node (j, node, &msg))
+    if (node >= 0 && !reconnect_node (j, node, &msg))
       {
 	FAIL ("unreachable", msg);
       }
@@ -2273,20 +2563,47 @@ namespace
       }
     string ha;
     bool ex = false;
-    node_ssh (j, node).read_file (cubrid + "/conf/cubrid_ha.conf", &ha, &ex);
+    read_on (j, node, cubrid + "/conf/cubrid_ha.conf", &ha, &ex);
     if (!contains (node_list_hosts (conf_get (ha, "[common]", "ha_node_list")), j->slave))
       {
-	FAIL ("config_edit_failed", node_label (j, node) + ": ha_node_list did not read back with " + j->slave);
+	FAIL ("config_edit_failed", node_label (j, node) + (node >= 0 ? ": " : "") + "ha_node_list did not read back with " + j->slave);
       }
     string out;
-    int rc = remote_on (j, node, "cubrid heartbeat reload 2>&1", &out, 300);
+    int rc = cubrid_on (j, node, { "heartbeat", "reload" }, &out, 300);
     *reloaded = true;
     save_state (j);
     if (rc != 0 || out.find ("fail") != string::npos)
       {
 	f->exit_code = rc;
 	f->has_exit = rc > 0;
-	FAIL ("command_failed", node_label (j, node) + ": cubrid heartbeat reload failed: " + trim (out));
+	FAIL ("command_failed", node_label (j, node) + (node >= 0 ? ": " : "") + "cubrid heartbeat reload failed: " + trim (out));
+      }
+    return true;
+  }
+
+  bool st_master_config (job_t *j, step_fail *f)
+  {
+    return add_slave_to_node (j, -1, j->cubrid, j->cubrid_dbs, &j->reloaded, f);
+  }
+
+  /* the folder `replication start <slave>` copies the slave's log into on that node */
+  string slave_log_dir (job_t *j, const string &copy_base)
+  {
+    return copy_base + "/" + j->db + "_" + j->slave;
+  }
+
+  bool st_replication_start (job_t *j, step_fail *f)
+  {
+    j->m_repl_dir_existed = is_dir (slave_log_dir (j, j->m_copy_base));
+    j->repl_started = true;
+    save_state (j);
+    string out;
+    int rc = run_local (j, { bin (j, "cubrid"), "heartbeat", "replication", "start", j->slave }, &out, 300);
+    if (rc != 0 || out.find ("fail") != string::npos)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL (rc == -2 ? "cancelled" : "command_failed", "cubrid heartbeat replication start failed: " + trim (out));
       }
     return true;
   }
@@ -2314,16 +2631,17 @@ namespace
       {
 	rep_t *r = j->reps[k].get ();
 	string out;
-	r->repl_dir_existed = remote_dir_exists (j, (int) k + 1, slave_log_dir (j, r->copy_base));
+	remote_on (j, (int) k + 1, "test -d " + shq (slave_log_dir (j, r->copy_base)) + " && echo exists", &out, 30);
+	r->repl_dir_existed = out.find ("exists") != string::npos;
 	r->repl_started = true;
 	save_state (j);
+	out.clear ();
 	int rc = remote_on (j, (int) k + 1, "cubrid heartbeat replication start " + shq (j->slave) + " 2>&1", &out, 300);
 	if (rc != 0 || out.find ("fail") != string::npos)
 	  {
 	    f->exit_code = rc;
 	    f->has_exit = rc > 0;
-	    FAIL (rc == -2 ? "cancelled" : "command_failed",
-		  "replica " + r->host + ": cubrid heartbeat replication start failed: " + trim (out));
+	    FAIL (rc == -2 ? "cancelled" : "command_failed", "replica " + r->host + ": cubrid heartbeat replication start failed: " + trim (out));
 	  }
       }
     if (j->reps.empty ())
@@ -2333,139 +2651,160 @@ namespace
     return true;
   }
 
+  bool st_verify (job_t *j, step_fail *f)
+  {
+    string last;
+    for (int i = 0; i < 40; i++)
+      {
+	string out;
+	remote_on (j, 0, "cubrid changemode " + shq (j->db + "@localhost") + " 2>&1", &out, 60);
+	last = trim (out);
+	if (out.find ("is standby") != string::npos)
+	  {
+	    return true;
+	  }
+	if (j->cancel.load ())
+	  {
+	    FAIL ("cancelled", "cancelled");
+	  }
+	sleep (3);
+      }
+    FAIL ("verify_failed", "slave " + j->slave + ": did not become standby: " + last);
+  }
+
+  bool st_cleanup (job_t *j, step_fail *f)
+  {
+    string msg;
+    if (!j->m_bk_dir.empty ())
+      {
+	remove_tree (j->m_bk_dir);
+	job_log (j, "removed " + j->m_bk_dir);
+      }
+    if (!j->s_bk_dir.empty () && reconnect_node (j, 0, &msg))
+      {
+	remote_on (j, 0, "rm -rf " + shq (j->s_bk_dir), NULL, 600);
+      }
+    return true;
+  }
+
 #undef FAIL
+
+  /* ------------------------------------------------------------ rollback */
 
   bool has_undo (const string &id)
   {
-    return id == "slave_config" || id == "master_backup" || id == "fetch_backup" || id == "keep_old_db" || id == "restore"
-	   || id == "copylog" || id == "master_config" || id == "replication_start" || id == "slave_ha_start"
-	   || id == "replica_config" || id == "replica_replication_start";
+    static const char *ids[] = { "convert_config", "convert_restart", "slave_config", "master_backup", "send_backup",
+				 "slave_keep_old_db", "slave_restore", "slave_copylog", "slave_ha_start", "master_config",
+				 "replication_start", "replica_config", "replica_replication_start", NULL
+			       };
+    for (int i = 0; ids[i] != NULL; i++)
+      {
+	if (id == ids[i])
+	  {
+	    return true;
+	  }
+      }
+    return false;
   }
 
   /* undo one finished (or failed) step; true when it is back as before */
   bool rollback_step (job_t *j, const string &id)
   {
-    string msg;
+    string msg, out;
     bool ok = true;
-    if (id == "slave_ha_start" && j->ha_started)
+    if (id == "convert_restart" && j->c_restarted)
       {
-	ok = run_local (j, { bin (j, "cubrid"), "heartbeat", "stop", j->db }, NULL, 600) == 0;
-	/* heartbeat start brought cub_master up and heartbeat stop leaves it; when there was none before, stop it
-	   (`cubrid master stop` is `cub_commdb -A`, which this CMS survives) so the precheck passes again */
-	if (!j->master_was_running && cub_master_running ())
-	  {
-	    run_local (j, { bin (j, "cub_commdb"), "-A" }, NULL, 120);
-	    for (int i = 0; i < 20 && cub_master_running (); i++)
-	      {
-		sleep (1);
-	      }
-	    ok = !cub_master_running () && ok;
-	  }
+	/* back to a single database: heartbeat off, cub_master down; convert_config is undone next, then the
+	   database starts again without HA (in the convert_config undo) */
+	run_local (j, { bin (j, "cubrid"), "heartbeat", "stop" }, NULL, 600);
+	ok = stop_local_cub_master (j);
       }
-    else if (id == "replication_start" && j->repl_started)
+    else if (id == "convert_config")
       {
-	/* runs before master_config is undone: replication stop fails once the node is not in ha_node_list,
-	   and the command then still ends with "success", so read the output */
-	string out;
-	ok = reconnect (j, &msg) && remote (j, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
-	     && out.find (": fail") == string::npos;
-	if (ok && !j->m_repl_dir_existed)
+	ok = restore_edits (j, -1);
+	if (j->c_restarted)
 	  {
-	    ok = remote (j, "rm -rf " + shq (slave_log_dir (j, j->m_copy_base)), NULL, 120) == 0;
+	    int rc = run_local (j, { bin (j, "cubrid"), "server", "start", j->db }, &out, 600);
+	    ok = rc == 0 && out.find (": fail") == string::npos && ok;
+	    job_log (j, string ("service interruption ends: ") + j->db + (ok ? " runs again without HA" : " did not start again"));
 	  }
       }
     else if (id == "replica_replication_start")
       {
-	/* before replica_config is undone, for the same reason as replication_start */
+	/* before replica_config is undone: replication stop fails once the node is not in ha_node_list, and the
+	   command then still ends with "success", so the output is read */
 	for (size_t k = 0; k < j->reps.size (); k++)
 	  {
-	    if (!j->reps[k]->repl_started)
+	    rep_t *r = j->reps[k].get ();
+	    if (!r->repl_started)
 	      {
 		continue;
 	      }
-	    string out;
+	    out.clear ();
 	    bool one = reconnect_node (j, (int) k + 1, &msg)
 		       && remote_on (j, (int) k + 1, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
 		       && out.find (": fail") == string::npos;
-	    if (one && !j->reps[k]->repl_dir_existed)
+	    if (one && !r->repl_dir_existed)
 	      {
-		one = remote_on (j, (int) k + 1, "rm -rf " + shq (slave_log_dir (j, j->reps[k]->copy_base)), NULL, 120) == 0;
+		one = remote_on (j, (int) k + 1, "rm -rf " + shq (slave_log_dir (j, r->copy_base)), NULL, 120) == 0;
 	      }
 	    ok = one && ok;
 	  }
       }
-    else if (id == "master_config" || id == "slave_config" || id == "replica_config")
+    else if (id == "replica_config")
       {
-	/* nodes whose files this step edited: -1 this server, 0 the master, k>0 replicas */
-	vector<int> nodes;
-	if (id == "slave_config")
+	for (size_t k = 0; k < j->reps.size (); k++)
 	  {
-	    nodes.push_back (-1);
-	  }
-	else if (id == "master_config")
-	  {
-	    nodes.push_back (0);
-	  }
-	else
-	  {
-	    for (size_t k = 0; k < j->reps.size (); k++)
+	    ok = restore_edits (j, (int) k + 1) && ok;
+	    if (j->reps[k]->reloaded)
 	      {
-		nodes.push_back ((int) k + 1);
-	      }
-	  }
-	for (int node : nodes)
-	  {
-	    if (node >= 0 && !reconnect_node (j, node, &msg))
-	      {
-		ok = false;
-		continue;
-	      }
-	    for (auto it = j->edits.rbegin (); it != j->edits.rend (); ++it)
-	      {
-		if (it->node != node)
-		  {
-		    continue;
-		  }
-		if (node >= 0)
-		  {
-		    string cmd = it->existed ? "mv -f " + shq (it->bak) + " " + shq (it->path) : "rm -f " + shq (it->path);
-		    ok = remote_on (j, node, cmd, NULL, 60) == 0 && ok;
-		  }
-		else if (it->existed)
-		  {
-		    ok = rename (it->bak.c_str (), it->path.c_str ()) == 0 && ok;
-		  }
-		else
-		  {
-		    ok = unlink (it->path.c_str ()) == 0 && ok;
-		  }
-		job_log (j, (node >= 0 ? node_label (j, node) + ": " : string ("")) + "restored " + it->path);
-	      }
-	    bool reloaded = node == 0 ? j->reloaded : node > 0 ? j->reps[node - 1]->reloaded : false;
-	    if (reloaded)
-	      {
-		ok = remote_on (j, node, "cubrid heartbeat reload 2>&1", NULL, 300) == 0 && ok;
+		ok = remote_on (j, (int) k + 1, "cubrid heartbeat reload 2>&1", NULL, 300) == 0 && ok;
 	      }
 	  }
       }
-    else if (id == "copylog" && !j->repl_dir.empty ())
+    else if (id == "replication_start" && j->repl_started)
       {
-	ok = remove_tree (j->repl_dir);
-      }
-    else if (id == "restore" && j->restored_new)
-      {
-	ok = remove_tree (j->s_db_line[1]);
-	if (j->s_db_line[3] != j->s_db_line[1])
+	int rc = run_local (j, { bin (j, "cubrid"), "heartbeat", "replication", "stop", j->slave }, &out, 300);
+	ok = rc == 0 && out.find (": fail") == string::npos;
+	if (ok && !j->m_repl_dir_existed)
 	  {
-	    ok = remove_tree (j->s_db_line[3]) && ok;
+	    ok = remove_tree (slave_log_dir (j, j->m_copy_base));
 	  }
       }
-    else if (id == "keep_old_db")
+    else if (id == "master_config")
       {
-	for (auto it = j->moved.rbegin (); it != j->moved.rend (); ++it)
+	ok = restore_edits (j, -1);
+	if (j->reloaded)
 	  {
-	    remove_tree (it->first);
-	    bool r = rename (it->second.c_str (), it->first.c_str ()) == 0;
+	    ok = run_local (j, { bin (j, "cubrid"), "heartbeat", "reload" }, NULL, 300) == 0 && ok;
+	  }
+      }
+    else if (id == "slave_ha_start" && j->ha_started)
+      {
+	ok = reconnect_node (j, 0, &msg) && remote_daemon (j, 0, "cubrid heartbeat stop " + shq (j->db), NULL, 600) == 0;
+	/* heartbeat start left cub_master in HA mode; take it down (slave_config undo starts the old one again) */
+	remote_on (j, 0, "cub_commdb -A 2>&1", NULL, 120);
+	for (int i = 0; i < 30 && slave_master_running (j); i++)
+	  {
+	    sleep (1);
+	  }
+	ok = !slave_master_running (j) && ok;
+      }
+    else if (id == "slave_copylog" && !j->s_repl_dir.empty ())
+      {
+	ok = reconnect_node (j, 0, &msg) && remote_on (j, 0, "rm -rf " + shq (j->s_repl_dir), NULL, 120) == 0;
+      }
+    else if (id == "slave_restore" && j->restored_new)
+      {
+	ok = reconnect_node (j, 0, &msg)
+	     && remote_on (j, 0, "rm -rf " + shq (j->s_db_line[1]) + " " + shq (j->s_db_line[3]), NULL, 600) == 0;
+      }
+    else if (id == "slave_keep_old_db")
+      {
+	ok = reconnect_node (j, 0, &msg);
+	for (auto it = j->moved.rbegin (); ok && it != j->moved.rend (); ++it)
+	  {
+	    bool r = remote_on (j, 0, "rm -rf " + shq (it->first) + " && mv " + shq (it->second) + " " + shq (it->first), NULL, 600) == 0;
 	    job_log (j, string (r ? "moved back " : "could not move back ") + it->second);
 	    ok = r && ok;
 	  }
@@ -2475,13 +2814,28 @@ namespace
 	    j->kept.clear ();
 	  }
       }
-    else if (id == "fetch_backup" && !j->s_bk_dir.empty ())
+    else if (id == "send_backup" && !j->s_bk_dir.empty ())
       {
-	ok = remove_tree (j->s_bk_dir);
+	ok = reconnect_node (j, 0, &msg) && remote_on (j, 0, "rm -rf " + shq (j->s_bk_dir), NULL, 600) == 0;
       }
     else if (id == "master_backup" && !j->m_bk_dir.empty ())
       {
-	ok = reconnect (j, &msg) && remote (j, "rm -rf " + shq (j->m_bk_dir), NULL, 600) == 0;
+	ok = remove_tree (j->m_bk_dir);
+      }
+    else if (id == "slave_config")
+      {
+	ok = restore_edits (j, 0);
+	if (j->s_master_stopped)
+	  {
+	    /* it ran (without HA) before slave_ha_start took it down: start it again, now with the old settings */
+	    remote_daemon (j, 0, "cub_master", NULL, 120);
+	    bool up = false;
+	    for (int i = 0; i < 20 && !(up = slave_master_running (j)); i++)
+	      {
+		sleep (1);
+	      }
+	    ok = up && ok;
+	  }
       }
     return ok;
   }
@@ -2504,38 +2858,44 @@ namespace
     save_state (j);
   }
 
+  typedef bool (*step_fn) (job_t *, step_fail *);
+
   void run_job (std::shared_ptr<job_t> jp)
   {
     job_t *j = jp.get ();
-    typedef bool (*step_fn) (job_t *, step_fail *);
-    /* order of STEP_DEFS; as in the manual, this server's HA starts before the others add it */
-    step_fn fns[] = { st_precheck, st_connect, st_master_check, st_replica_check, st_slave_config, st_master_backup,
-		      st_fetch_backup, st_keep_old_db, st_restore, st_copylog, st_slave_ha_start, st_master_config,
-		      st_replication_start, st_replica_config, st_replica_replication_start, st_verify, st_cleanup
-		    };
-    static_assert (sizeof (fns) / sizeof (fns[0]) == sizeof (STEP_DEFS) / sizeof (STEP_DEFS[0]), "one function per step");
+    vector<step_fn> fns;
+    if (j->kind == "convert_master")
+      {
+	fns = { st_convert_precheck, st_convert_config, st_convert_restart, st_convert_verify };
+      }
+    else
+      {
+	fns = { st_precheck, st_slave_connect, st_slave_check, st_replica_check, st_slave_config, st_master_backup,
+		st_send_backup, st_slave_keep_old_db, st_slave_restore, st_slave_copylog, st_slave_ha_start,
+		st_master_config, st_replication_start, st_replica_config, st_replica_replication_start, st_verify,
+		st_cleanup
+	      };
+      }
+    int count = (int) j->steps.size ();
     int failed_at = -1;
     step_fail f;
-    f.exit_code = -1;
-    f.has_exit = false;
-    for (int i = 0; i < STEP_COUNT; i++)
+    for (int i = 0; i < count; i++)
       {
+	string id = j->steps[i].id;
 	if (j->cancel.load ())
 	  {
 	    f.error = "cancelled";
-	    f.message = "cancelled before " + j->steps[i].id;
+	    f.message = "cancelled before " + id;
 	    failed_at = i - 1;
 	    break;
 	  }
-	string id = j->steps[i].id;
 	if (!j->start_ha && (id == "slave_ha_start" || id == "verify"))
 	  {
 	    set_step (j, i, "skipped", "start_ha=no");
 	    continue;
 	  }
 	set_step (j, i, "running");
-	job_log (j, "step " + std::to_string (i + 1) + "/" + std::to_string (STEP_COUNT) + " " + id + ": "
-		 + j->steps[i].title);
+	job_log (j, "step " + std::to_string (i + 1) + "/" + std::to_string (count) + " " + id + ": " + j->steps[i].title);
 	bool ok = false;
 	try
 	  {
@@ -2580,11 +2940,9 @@ namespace
     j->rolling_back.store (true);
     save_state (j);
     job_log (j, "rolling back");
-    /* the failed step may have changed things too, so it is undone as well */
     for (int i = failed_at; i >= 0; i--)
       {
-	string id = j->steps[i].id;
-	string state;
+	string id = j->steps[i].id, state;
 	{
 	  std::lock_guard<std::mutex> lg (j->mu);
 	  state = j->steps[i].state;
@@ -2661,6 +3019,87 @@ namespace
       }
     return pw;
   }
+
+  string quick_cubrid_rel ()
+  {
+    string out;
+    FILE *p = popen ((env_or ("CUBRID", "") + "/bin/cubrid_rel 2>/dev/null").c_str (), "r");
+    if (p != NULL)
+      {
+	char buf[512];
+	while (fgets (buf, sizeof (buf), p) != NULL)
+	  {
+	    if (out.empty () && strstr (buf, "CUBRID") != NULL)
+	      {
+		out = buf;
+	      }
+	  }
+	pclose (p);
+      }
+    return out;
+  }
+
+  /* `cubrid ...` from the HTTP thread (quick checks before a job starts) */
+  string quick_cubrid (const string &args)
+  {
+    string out;
+    FILE *p = popen ((env_or ("CUBRID", "") + "/bin/cubrid " + args + " 2>&1").c_str (), "r");
+    if (p != NULL)
+      {
+	char buf[512];
+	while (fgets (buf, sizeof (buf), p) != NULL)
+	  {
+	    out += buf;
+	  }
+	pclose (p);
+      }
+    return out;
+  }
+
+  /* start a job; caller filled everything but uuid/state/steps */
+  int start_job (std::shared_ptr<job_t> j, const char *defs[][2], int ndefs, Json::Value &response)
+  {
+    std::lock_guard<std::mutex> lg (g_jobs_mu);
+    if (g_job)
+      {
+	std::lock_guard<std::mutex> jl (g_job->mu);
+	if (g_job->status == "running")
+	  {
+	    return fail_resp (response, "another job is running: " + g_job->uuid);
+	  }
+      }
+    j->uuid = new_uuid ();
+    j->state_dir = state_root () + "/" + j->uuid;
+    j->started = time (NULL);
+    for (int i = 0; i < ndefs; i++)
+      {
+	step_t s;
+	s.id = defs[i][0];
+	s.title = defs[i][1];
+	s.state = "pending";
+	j->steps.push_back (s);
+      }
+    if (!mkdir_p (j->state_dir))
+      {
+	return fail_resp (response, "cannot create " + j->state_dir);
+      }
+    save_state (j.get ());
+    g_job = j;
+    try
+      {
+	std::thread (run_job, j).detach ();
+      }
+    catch (std::exception &e)
+      {
+	g_job.reset ();
+	return fail_resp (response, string ("cannot start the job: ") + e.what ());
+      }
+    LOG_INFO ("ha_make_slave: started %s job %s (db %s)", j->kind.c_str (), j->uuid.c_str (), j->db.c_str ());
+    response["uuid"] = j->uuid;
+    response["job_kind"] = j->kind;
+    response["job_status"] = "running";
+    return build_server_header (response, ERR_NO_ERROR, "none");
+  }
 }
 
 /* ---------------------------------------------------------------- tasks */
@@ -2684,23 +3123,7 @@ ext_ha_check_ssh (Json::Value &request, Json::Value &response)
   string err = c.connect (host, port, user, &msg);
   response["hostkey_type"] = c.keytype;
   response["hostkey_sha256"] = c.fp;
-  string local_rel;
-  {
-    FILE *p = popen ((env_or ("CUBRID", "") + "/bin/cubrid_rel 2>/dev/null").c_str (), "r");
-    if (p != NULL)
-      {
-	char buf[512];
-	while (fgets (buf, sizeof (buf), p) != NULL)
-	  {
-	    if (local_rel.empty () && strstr (buf, "CUBRID") != NULL)
-	      {
-		local_rel = buf;
-	      }
-	  }
-	pclose (p);
-      }
-  }
-  response["local_version"] = parse_version (local_rel);
+  response["local_version"] = parse_version (quick_cubrid_rel ());
 
   string result = "ok";
   if (!err.empty ())
@@ -2782,20 +3205,79 @@ ext_ha_check_ssh (Json::Value &request, Json::Value &response)
 }
 
 int
+ext_ha_convert_master (Json::Value &request, Json::Value &response)
+{
+  std::shared_ptr<job_t> j = std::make_shared<job_t> ();
+  j->kind = "convert_master";
+  j->db = req_str (request, "db_name");
+  j->master = req_str (request, "master_host", local_hostname ());
+  j->ha_group = req_str (request, "ha_group", "cubrid");
+  j->ha_port_id = req_str (request, "ha_port_id", "59901");
+  j->cubrid = env_or ("CUBRID", "");
+  j->cubrid_dbs = env_or ("CUBRID_DATABASES", "");
+  int port_id = 0;
+  if (!valid_name (j->db) || !valid_name (j->master) || !valid_name (j->ha_group) || !parse_port (j->ha_port_id, &port_id))
+    {
+      return fail_resp (response, "invalid db_name, master_host, ha_group or ha_port_id");
+    }
+  /* quick checks so the screen can tell the user before anything stops */
+  string conf, ha;
+  bool ex = false;
+  read_local_file (j->cubrid + "/conf/cubrid.conf", &conf, &ex);
+  if (conf_get (conf, "[common]", "ha_mode") == "on")
+    {
+      return fail_resp (response, "already_ha");
+    }
+  vector<string> up = running_servers (quick_cubrid ("server status"));
+  if (!contains (up, j->db))
+    {
+      return fail_resp (response, "database " + j->db + " is not running");
+    }
+  vector<string> others;
+  for (const string &s : up)
+    {
+      if (s != j->db)
+	{
+	  others.push_back (s);
+	}
+    }
+  if (!others.empty ())
+    {
+      response["running_databases"] = join (others, ",");
+      return fail_resp (response, "other_db_running: " + join (others, ", ") + " (they would stop too; stop them first)");
+    }
+  read_local_file (j->cubrid + "/conf/cubrid_ha.conf", &ha, &ex);
+  if (!conf_get (ha, "[common]", "ha_node_list").empty ())
+    {
+      return fail_resp (response, "cubrid_ha.conf already has ha_node_list; fix the HA settings by hand first");
+    }
+  response["master_restart"] = "yes";
+  if (req_str (request, "confirm_master_restart") != "yes")
+    {
+      response["message"] = "converting " + j->db + " to an HA master restarts it (the service stops until it is the active master)";
+      return fail_resp (response, "confirm_master_restart");
+    }
+  return start_job (j, CONVERT_STEPS, sizeof (CONVERT_STEPS) / sizeof (CONVERT_STEPS[0]), response);
+}
+
+int
 ext_ha_make_slave (Json::Value &request, Json::Value &response)
 {
   string pw = take_password (request);
   std::shared_ptr<job_t> j = std::make_shared<job_t> ();
+  j->kind = "make_slave";
+  j->pw = pw;
+  wipe (pw);
   j->db = req_str (request, "db_name");
-  j->master = req_str (request, "master_host");
+  j->slave = req_str (request, "slave_host");
   j->user = req_str (request, "os_user");
   j->fp = req_str (request, "hostkey_sha256");
-  j->slave = req_str (request, "slave_host", local_hostname ());
+  j->master = req_str (request, "master_host", local_hostname ());
   j->cubrid = env_or ("CUBRID", "");
   j->cubrid_dbs = env_or ("CUBRID_DATABASES", "");
-  j->repl_home = req_str (request, "repl_log_home", j->cubrid_dbs);
-  j->m_bk_root = req_str (request, "master_backup_path");
-  j->s_bk_root = req_str (request, "slave_backup_path", j->cubrid_dbs + "/ha_make_slave_backup");
+  j->repl_home = req_str (request, "repl_log_home");
+  j->m_bk_root = req_str (request, "master_backup_path", j->cubrid_dbs + "/ha_make_slave_backup");
+  j->s_bk_root = req_str (request, "slave_backup_path");
   string start_ha = req_str (request, "start_ha", "yes");
   j->start_ha = (start_ha != "no");
 
@@ -2804,17 +3286,17 @@ ext_ha_make_slave (Json::Value &request, Json::Value &response)
     {
       bad = "db_name";
     }
-  else if (!valid_name (j->master))
+  else if (!valid_name (j->slave))
     {
-      bad = "master_host";
+      bad = "slave_host";
     }
   else if (!valid_name (j->user))
     {
       bad = "os_user";
     }
-  else if (!valid_name (j->slave))
+  else if (!valid_name (j->master))
     {
-      bad = "slave_host";
+      bad = "master_host";
     }
   else if (j->fp.compare (0, 7, "SHA256:") != 0)
     {
@@ -2824,15 +3306,15 @@ ext_ha_make_slave (Json::Value &request, Json::Value &response)
     {
       bad = "ssh_port";
     }
-  else if (!valid_path (j->repl_home))
+  else if (!j->repl_home.empty () && !valid_path (j->repl_home))
     {
       bad = "repl_log_home";
     }
-  else if (!j->m_bk_root.empty () && !valid_path (j->m_bk_root))
+  else if (!valid_path (j->m_bk_root))
     {
       bad = "master_backup_path";
     }
-  else if (!valid_path (j->s_bk_root))
+  else if (!j->s_bk_root.empty () && !valid_path (j->s_bk_root))
     {
       bad = "slave_backup_path";
     }
@@ -2840,19 +3322,17 @@ ext_ha_make_slave (Json::Value &request, Json::Value &response)
     {
       bad = "start_ha";
     }
-  else if (pw.empty ())
+  else if (j->pw.empty ())
     {
       bad = "os_password";
     }
-  if (!bad.empty ())
+  else if (j->slave == j->master)
     {
-      wipe (pw);
-      return fail_resp (response, "invalid or missing " + bad);
+      bad = "slave_host (same as master_host)";
     }
   if (!request["replicas"].isNull () && !request["replicas"].isArray ())
     {
-      wipe (pw);
-      return fail_resp (response, "replicas must be an array");
+      bad = "replicas (must be an array)";
     }
   for (Json::UInt i = 0; request["replicas"].isArray () && i < request["replicas"].size (); i++)
     {
@@ -2866,7 +3346,10 @@ ext_ha_make_slave (Json::Value &request, Json::Value &response)
 	  r->fp = req_str (e, "hostkey_sha256");
 	}
       string what = "replicas[" + std::to_string (i) + "].";
-      if (!e.isObject () || !valid_name (r->host))
+      if (!bad.empty ())
+	{
+	}
+      else if (!e.isObject () || !valid_name (r->host))
 	{
 	  bad = what + "host";
 	}
@@ -2892,7 +3375,7 @@ ext_ha_make_slave (Json::Value &request, Json::Value &response)
 	}
       for (auto &o : j->reps)
 	{
-	  if (o->host == r->host)
+	  if (bad.empty () && o->host == r->host)
 	    {
 	      bad = what + "host (listed twice)";
 	    }
@@ -2901,59 +3384,17 @@ ext_ha_make_slave (Json::Value &request, Json::Value &response)
     }
   if (!bad.empty ())
     {
-      wipe (pw);
       return fail_resp (response, "invalid or missing " + bad);
     }
-  if (j->master == j->slave)
+  string conf;
+  bool ex = false;
+  read_local_file (j->cubrid + "/conf/cubrid.conf", &conf, &ex);
+  if (conf_get (conf, "[common]", "ha_mode") != "on")
     {
-      wipe (pw);
-      return fail_resp (response, "master_host and slave_host are the same");
+      response["message"] = j->db + " is not an HA master here; convert it with ha_convert_master first";
+      return fail_resp (response, "master_not_ha");
     }
-
-  std::lock_guard<std::mutex> lg (g_jobs_mu);
-  if (g_job)
-    {
-      std::lock_guard<std::mutex> jl (g_job->mu);
-      if (g_job->status == "running")
-	{
-	  wipe (pw);
-	  return fail_resp (response, "another ha_make_slave job is running: " + g_job->uuid);
-	}
-    }
-  j->uuid = new_uuid ();
-  j->state_dir = state_root () + "/" + j->uuid;
-  j->pw = pw;
-  wipe (pw);
-  j->started = time (NULL);
-  for (int i = 0; i < STEP_COUNT; i++)
-    {
-      step_t s;
-      s.id = STEP_DEFS[i][0];
-      s.title = STEP_DEFS[i][1];
-      s.state = "pending";
-      j->steps.push_back (s);
-    }
-  if (!mkdir_p (j->state_dir))
-    {
-      wipe (j->pw);
-      return fail_resp (response, "cannot create " + j->state_dir);
-    }
-  save_state (j.get ());
-  g_job = j;
-  try
-    {
-      std::thread (run_job, j).detach ();
-    }
-  catch (std::exception &e)
-    {
-      wipe (j->pw);
-      g_job.reset ();
-      return fail_resp (response, string ("cannot start the job: ") + e.what ());
-    }
-  LOG_INFO ("ha_make_slave: started job %s (db %s, master %s)", j->uuid.c_str (), j->db.c_str (), j->master.c_str ());
-  response["uuid"] = j->uuid;
-  response["job_status"] = "running";
-  return build_server_header (response, ERR_NO_ERROR, "none");
+  return start_job (j, MAKE_STEPS, sizeof (MAKE_STEPS) / sizeof (MAKE_STEPS[0]), response);
 }
 
 int
@@ -2989,7 +3430,7 @@ ext_ha_make_slave_status (Json::Value &request, Json::Value &response)
 	}
       for (const string &k : v.getMemberNames ())
 	{
-	  if (k != "moved" && k != "edited_files")
+	  if (k != "moved" && k != "edited_files" && k != "slave_ssh")
 	    {
 	      response[k] = v[k];
 	    }
@@ -3053,10 +3494,12 @@ ext_ha_make_slave_cancel (Json::Value &request, Json::Value &response)
 int
 ext_ha_make_slave_cleanup (Json::Value &request, Json::Value &response)
 {
+  string pw = take_password (request);
   string uuid = req_str (request, "uuid");
-  if (!valid_uuid (uuid))
+  if (!valid_uuid (uuid) || pw.empty ())
     {
-      return fail_resp (response, "invalid uuid");
+      wipe (pw);
+      return fail_resp (response, "invalid uuid or missing os_password (of the new slave)");
     }
   string data;
   bool ex = false;
@@ -3065,11 +3508,33 @@ ext_ha_make_slave_cleanup (Json::Value &request, Json::Value &response)
   Json::Reader r;
   if (!ex || !r.parse (data, v))
     {
+      wipe (pw);
       return fail_resp (response, "no such job: " + uuid);
     }
-  if (v["job_status"].asString () != "success")
+  if (v["job_kind"].asString () != "make_slave" || v["job_status"].asString () != "success")
     {
-      return fail_resp (response, "only a successful job's kept database can be removed");
+      wipe (pw);
+      return fail_resp (response, "only a successful make_slave job's kept database can be removed");
+    }
+  const Json::Value &ss = v["slave_ssh"];
+  string host = ss["host"].asString (), user = ss["os_user"].asString (), fp = ss["hostkey_sha256"].asString ();
+  int port = ss["port"].isIntegral () ? ss["port"].asInt () : 22;
+  ssh_conn c;
+  string msg;
+  string err = c.connect (host, port, user, &msg);
+  if (err.empty () && c.fp != fp)
+    {
+      err = "hostkey_mismatch";
+      msg = "the host key of " + host + " is " + c.fp + ", not " + fp;
+    }
+  if (err.empty ())
+    {
+      err = c.auth (pw, &msg);
+    }
+  wipe (pw);
+  if (!err.empty ())
+    {
+      return fail_resp (response, err + ": " + msg);
     }
   Json::Value removed (Json::arrayValue);
   string suffix = ".ha_make_slave_" + uuid;
@@ -3082,11 +3547,12 @@ ext_ha_make_slave_cleanup (Json::Value &request, Json::Value &response)
 	{
 	  continue;
 	}
-      if (remove_tree (path))
+      if (c.exec ("rm -rf " + shq (path), NULL, nullptr, NULL, 600) == 0)
 	{
 	  removed.append (path);
 	}
     }
+  c.close ();
   v["kept_db_paths"] = Json::Value (Json::arrayValue);
   Json::StyledWriter w;
   write_local_file (state_root () + "/" + uuid + "/state.json", w.write (v));

@@ -95,6 +95,7 @@ static T_EXTEND_TASK_INFO ext_task_info[] =
 #if !defined(WINDOWS)
   /* HA slave POC, docs/ha-make-slave-poc-api.md */
   {"ha_check_ssh", 0, ext_ha_check_ssh, AU_ADMIN},
+  {"ha_convert_master", 0, ext_ha_convert_master, AU_ADMIN},
   {"ha_make_slave", 0, ext_ha_make_slave, AU_ADMIN},
   {"ha_make_slave_status", 0, ext_ha_make_slave_status, AU_ADMIN},
   {"ha_make_slave_cancel", 0, ext_ha_make_slave_cancel, AU_ADMIN},
