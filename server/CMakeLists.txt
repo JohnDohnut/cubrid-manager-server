@@ -267,8 +267,10 @@ target_compile_definitions(cm_admin PRIVATE
 target_compile_options(cm_admin PRIVATE ${CMS_WARN_FLAGS})
 target_include_directories(cm_admin PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR} ${CMS_SRC_DIR} ${CMS_CUBRID_INCLUDES} ${CMS_OPENSSL_INCLUDES})
+# The static OpenSSL goes before the CUBRID libraries: libcubridcs of released engines (11.4.5) defines and
+# exports its own OpenSSL 1.1.1, and a library listed first would take every OpenSSL call of this program.
 target_link_libraries(cm_admin PRIVATE
-  ${CMS_CUBRID_LIBS} ${CMS_OPENSSL_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+  ${CMS_OPENSSL_LIBS} ${CMS_CUBRID_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
 
 add_executable(cub_manager ${CUB_MANAGER_SOURCES})
 target_compile_definitions(cub_manager PRIVATE
@@ -282,15 +284,19 @@ target_include_directories(cub_manager PRIVATE
 # headers of the very library it links, which was not the case before.
 # ${CMAKE_DL_LIBS} is for the static libcrypto, which calls dlopen/dlclose. In-tree it
 # comes along with libcubridcs; a standalone build has to ask for it.
+# libssh2 and OpenSSL (static) before the CUBRID libraries, for the reason given at cm_admin.
 target_link_libraries(cub_manager PRIVATE
-  ${CMS_CUBRID_LIBS} ${CMS_EXTERNAL_LIBS} ${CMS_OPENSSL_LIBS}
+  ${CMS_EXTERNAL_LIBS} ${CMS_LIBSSH2_LIBS} ${CMS_OPENSSL_LIBS} ${CMS_CUBRID_LIBS}
   Threads::Threads ${CMAKE_DL_LIBS} rt)
 
 # HA slave POC: ssh to the master and replicas through the static libssh2 (no system ssh/scp).
 # libssh2.a goes before the OpenSSL archives it calls into.
 target_include_directories(cub_manager BEFORE PRIVATE ${CMS_LIBSSH2_INCLUDES})
-target_link_libraries(cub_manager PRIVATE ${CMS_LIBSSH2_LIBS} ${CMS_OPENSSL_LIBS} ${CMAKE_DL_LIBS})
 add_dependencies(cub_manager cms_libssh2)
+# libcubridcs/libcascci of released engines (11.4.5) export their own bundled OpenSSL 1.1.1. Without this the
+# executable would also export the OpenSSL 3 symbols those libraries call into, and the two copies would get
+# mixed in one process. Keep ours to ourselves.
+target_link_options(cub_manager PRIVATE "-Wl,--exclude-libs,libssl.a:libcrypto.a:libssh2.a")
 if(CMS_STANDALONE AND CMS_STATIC_OPENSSL)
   add_dependencies(cm_admin cms_openssl)
   target_include_directories(cm_admin BEFORE PRIVATE ${CMS_OPENSSL_INCLUDES})
