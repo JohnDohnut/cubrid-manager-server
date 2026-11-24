@@ -133,9 +133,9 @@ CMS가 재시작된 뒤: 메모리에 없는 uuid는 상태 파일을 읽어 돌
 | 8 | `keep_old_db` | 슬레이브 | 기존 슬레이브 DB 볼륨·로그 폴더와 복제 로그 폴더가 있으면 `<경로>.ha_make_slave_<uuid>`로 옮겨 보관 | 옮겨졌는지 | 제자리로 옮김 |
 | 9 | `restore` | 슬레이브 | `cubrid restoreslave -s master -m <마스터> -B <받은 폴더> <db>` | 종료 코드 | 새로 만든 볼륨·로그 지움 |
 | 10 | `copylog` | 슬레이브 | `cub_admin copylogdb -L <repl_log_home>/<db>_<마스터> -m async --start-page-id=-1 <db>@<마스터>` | 종료 코드 | 복제 로그 폴더 지움 |
-| 11 | `slave_ha_start` | 슬레이브 | 절차 9: `cubrid heartbeat start <db>`(`start_ha=no`면 건너뜀) | 명령 출력 | `cubrid heartbeat stop <db>` |
+| 11 | `slave_ha_start` | 슬레이브 | 절차 9: `cubrid heartbeat start <db>`(`start_ha=no`면 건너뜀) | 명령 출력 | `cubrid heartbeat stop <db>`, 작업 전에 cub_master가 없었으면 `cub_commdb -A`로 cub_master도 내림 |
 | 12 | `master_config` | 마스터 | 절차 6·8: cubrid_ha.conf `ha_node_list`에 슬레이브 추가(`ha_copy_sync_mode`도 노드 수만큼. 모자라면 reload가 "Invalid Parameter. ha_copy_sync_mode"로 실패함), databases.txt 그 DB 줄 호스트에 슬레이브 추가. `.bak.<uuid>` 남김. 이어서 `cubrid heartbeat reload` | 다시 읽어 값 확인, 명령 출력 | `.bak`로 복원 후 reload |
-| 13 | `replication_start` | 마스터 | 절차 7: `cubrid heartbeat replication start <슬레이브>`(마스터에 슬레이브용 copylogdb와 applylogdb를 띄움) | 명령 출력 | `cubrid heartbeat replication stop <슬레이브>`(12단계 되돌리기보다 먼저. 노드 목록에서 빠진 뒤에는 stop이 실패하면서도 마지막 줄은 success로 끝나므로 출력에서 `: fail`을 봄) |
+| 13 | `replication_start` | 마스터 | 절차 7: `cubrid heartbeat replication start <슬레이브>`(마스터에 슬레이브용 copylogdb와 applylogdb를 띄움) | 명령 출력 | `cubrid heartbeat replication stop <슬레이브>`(12단계 되돌리기보다 먼저. 노드 목록에서 빠진 뒤에는 stop이 실패하면서도 마지막 줄은 success로 끝나므로 출력에서 `: fail`을 봄). 이 단계가 새로 만든 슬레이브 로그 복사 폴더(`<ha_copy_log_base>/<db>_<슬레이브>`)도 지움 |
 | 14 | `replica_config` | 레플리카마다 | 12단계와 같음(cubrid_ha.conf, databases.txt, reload) | 같음 | 같음 |
 | 15 | `replica_replication_start` | 레플리카마다 | 13단계와 같음. 레플리카가 새 슬레이브의 로그를 받기 시작함 | 같음 | 같음 |
 | 16 | `verify` | 슬레이브 | 절차 10: `cubrid changemode <db>@localhost`가 standby가 될 때까지 최대 120초(`start_ha=no`면 건너뜀) | standby | 없음 |
@@ -145,14 +145,15 @@ CMS가 재시작된 뒤: 메모리에 없는 uuid는 상태 파일을 읽어 돌
 - 13·15단계가 필요한 이유(실측, 11.4.5.1908): `heartbeat reload`는 노드 목록만 다시 읽고 프로세스를 띄우지 않음. 그래서 reload만 하면 정방향 복제는 되지만, failover 뒤 옛 마스터가 다시 붙을 때 그 직후 새 active에 쓴 데이터가 빠짐. `copylogdb start`만 한 경우도 마찬가지로 빠짐. applylogdb는 처음 뜰 때 복사된 로그의 현재 끝부터 적용하기 때문임(log_applier.c 2045~2101). replication start로 applylogdb까지 미리 띄워야 빠지지 않음.
 - 되돌리기: 실패하거나 취소되면 바꾼 것이 있는 단계(5~15)만 거꾸로 되돌림. 1~4·16·17처럼 되돌릴 것이 없는 단계는 상태(`done`/`failed`)를 그대로 둠. 취소 뒤에도 되돌리기 명령은 취소되지 않음.
 - 원격 명령은 ssh 라이브러리의 명령 실행으로 `bash -lc '...'`(로그인 셸, CUBRID 환경 변수 읽기)로 돌림. 비밀번호는 명령에 들어가지 않음.
-- 설정 파일은 SFTP로 읽어 CMS 안에서 그 항목만 고친 뒤 임시 파일로 쓰고 이름을 바꿈.
+- 설정 파일은 SFTP로 읽어 CMS 안에서 그 항목만 고친 뒤 임시 파일로 쓰고 이름을 바꿈. 되돌릴 때는 `.bak`을 제자리로 옮김(남지 않음). 성공하면 `.bak.<uuid>`는 남겨 둠.
 - 상태 파일: `$CUBRID/tmp/ha_make_slave/<uuid>/state.json`(단계별 상태, 옮긴 경로, 고친 파일과 `.bak` 이름. 비밀번호 없음). 진행 기록은 메모리에 최대 1 MB이고, 넘치면 앞부분을 버리며 `next_offset`은 계속 늘어남.
 - 한 번에 작업 하나. 끝난 작업은 다음 작업을 시작하기 전까지 조회할 수 있고, 그 뒤에는 상태 파일로 조회함.
 
 ## POC 한계
 
 - 슬레이브는 cub_master 없이 CMS만 떠 있어야 함. service가 떠 있으면 cub_master가 ha_mode=off로 떠 있어 `cubrid heartbeat start`가 실패함. 이를 풀려면 service(cub_master)를 내려야 하는데 CMS에는 service·cub_master를 내리는 API가 없고, CMS가 `cubrid service stop`을 실행하면 CMS 자신도 내려가 작업을 이어 갈 수 없음.
-- CMS가 재시작되면 진행 중이던 작업은 `interrupted`로만 보이고 되돌리지 않음.
+  - 참고: `cubrid master stop`의 실제 동작인 `cub_commdb -A`로 CMS를 살려 둔 채 cub_master만 내릴 수는 있음(실측). 하지만 그 노드의 DB 서버도 모두 내려가므로 task가 사전 조건을 풀려고 자동으로 하지는 않음. 되돌리기에서는 작업 전에 cub_master가 없었을 때만(그래서 다른 DB 서버도 없었을 때만) 이것으로 원래 상태로 돌림.
+- CMS가 재시작되면 진행 중이던 작업은 `interrupted`로만 보이고 되돌리지 않음. 그때까지 바뀐 것(고친 설정 파일과 `.bak`, 옮긴 폴더, 백업 폴더)은 상태 파일의 `edited_files`·`moved`와 `steps`로 알 수 있고, 사용자가 정리해야 함.
 - 여러 서버의 변경을 한 번에 성공시키거나 한 번에 취소하는 것은 안 됨. 되돌리기는 단계별로 최선을 다할 뿐임.
 - 마스터·레플리카 CMS로 같은 설정 파일을 동시에 저장하는 경우의 충돌 방지는 없음.
 - 기존 슬레이브를 백업 원본으로 쓰는 방식(매뉴얼의 기본 예)은 하지 않음. 백업은 항상 마스터에서 받음.

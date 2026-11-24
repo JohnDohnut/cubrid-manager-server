@@ -1158,8 +1158,8 @@ namespace
     string host, user, fp, pw;
     int port = 22;
     ssh_conn ssh;
-    string cubrid, dbs, version;
-    bool reloaded = false, repl_started = false;
+    string cubrid, dbs, version, copy_base;
+    bool reloaded = false, repl_started = false, repl_dir_existed = true;
     ~rep_t ()
     {
       wipe (pw);
@@ -1177,13 +1177,13 @@ namespace
     /* only the job thread touches these */
     string pw;
     ssh_conn ssh;
-    string m_cubrid, m_dbs, m_version, m_node_list, m_port_id, m_db_list, m_sync_mode, m_replica_list, m_haconf;
+    string m_copy_base, m_cubrid, m_dbs, m_version, m_node_list, m_port_id, m_db_list, m_sync_mode, m_replica_list, m_haconf;
     vector<std::unique_ptr<rep_t>> reps;
     vector<string> m_db_line, s_db_line;
     string m_bk_dir, s_bk_dir, repl_dir;
     vector<edit_t> edits;
     vector<std::pair<string, string>> moved;
-    bool restored_new = false, repl_started = false, ha_started = false, reloaded = false;
+    bool restored_new = false, repl_started = false, ha_started = false, reloaded = false, master_was_running = false, m_repl_dir_existed = true;
 
     /* shared with the status/cancel tasks, under mu */
     std::mutex mu;
@@ -1575,7 +1575,7 @@ namespace
     bool ok = on_remote ? node_ssh (j, node).read_file (path, &data, &exists) : read_local_file (path, &data, &exists);
     if (!ok)
       {
-	*msg = "cannot read " + path;
+	*msg = where + "cannot read " + path;
 	return false;
       }
     string next = change (data);
@@ -1594,7 +1594,7 @@ namespace
 	ok = on_remote ? node_ssh (j, node).write_file (e.bak, data) : write_local_file (e.bak, data);
 	if (!ok)
 	  {
-	    *msg = "cannot write " + e.bak;
+	    *msg = where + "cannot write " + e.bak;
 	    return false;
 	  }
       }
@@ -1611,7 +1611,7 @@ namespace
       }
     if (!ok)
       {
-	*msg = "cannot write " + path;
+	*msg = where + "cannot write " + path;
 	return false;
       }
     job_log (j, where + "edited " + path + (exists ? " (kept " + e.bak + ")" : " (new)"));
@@ -1721,6 +1721,11 @@ namespace
     j->m_sync_mode = conf_get (ha, "[common]", "ha_copy_sync_mode");
     j->m_replica_list = conf_get (ha, "[common]", "ha_replica_list");
     j->m_haconf = ha;
+    j->m_copy_base = conf_get (ha, "[common]", "ha_copy_log_base");
+    if (j->m_copy_base.empty ())
+      {
+	j->m_copy_base = j->m_dbs;
+      }
     {
       vector<string> mr = j->m_replica_list.empty () ? vector<string> () : node_list_hosts (j->m_replica_list);
       vector<string> asked;
@@ -2076,9 +2081,23 @@ namespace
     return add_slave_to_node (j, 0, j->m_cubrid, j->m_dbs, &j->reloaded, f);
   }
 
+  /* the folder `replication start <slave>` copies the slave's log into on that node */
+  string slave_log_dir (job_t *j, const string &copy_base)
+  {
+    return copy_base + "/" + j->db + "_" + j->slave;
+  }
+
+  bool remote_dir_exists (job_t *j, int node, const string &dir)
+  {
+    string out;
+    remote_on (j, node, "test -d " + shq (dir) + " && echo exists || echo none", &out, 30);
+    return out.find ("exists") != string::npos;
+  }
+
   bool st_replication_start (job_t *j, step_fail *f)
   {
     string out;
+    j->m_repl_dir_existed = remote_dir_exists (j, 0, slave_log_dir (j, j->m_copy_base));
     j->repl_started = true;
     save_state (j);
     int rc = remote (j, "cubrid heartbeat replication start " + shq (j->slave) + " 2>&1", &out, 300);
@@ -2094,6 +2113,7 @@ namespace
   bool st_slave_ha_start (job_t *j, step_fail *f)
   {
     string out;
+    j->master_was_running = cub_master_running ();
     j->ha_started = true;
     save_state (j);
     int rc = run_local (j, { bin (j, "cubrid"), "heartbeat", "start", j->db }, &out, 600);
@@ -2202,6 +2222,11 @@ namespace
 	  {
 	    FAIL ("precheck_failed", "replica " + r->host + " is not replicating " + j->db + " from " + j->master);
 	  }
+	r->copy_base = conf_get (ha, "[common]", "ha_copy_log_base");
+	if (r->copy_base.empty ())
+	  {
+	    r->copy_base = r->dbs;
+	  }
 	job_log (j, "replica " + r->host + ": CUBRID " + r->version + ", " + j->db + " is standby");
       }
     return true;
@@ -2289,6 +2314,7 @@ namespace
       {
 	rep_t *r = j->reps[k].get ();
 	string out;
+	r->repl_dir_existed = remote_dir_exists (j, (int) k + 1, slave_log_dir (j, r->copy_base));
 	r->repl_started = true;
 	save_state (j);
 	int rc = remote_on (j, (int) k + 1, "cubrid heartbeat replication start " + shq (j->slave) + " 2>&1", &out, 300);
@@ -2324,6 +2350,17 @@ namespace
     if (id == "slave_ha_start" && j->ha_started)
       {
 	ok = run_local (j, { bin (j, "cubrid"), "heartbeat", "stop", j->db }, NULL, 600) == 0;
+	/* heartbeat start brought cub_master up and heartbeat stop leaves it; when there was none before, stop it
+	   (`cubrid master stop` is `cub_commdb -A`, which this CMS survives) so the precheck passes again */
+	if (!j->master_was_running && cub_master_running ())
+	  {
+	    run_local (j, { bin (j, "cub_commdb"), "-A" }, NULL, 120);
+	    for (int i = 0; i < 20 && cub_master_running (); i++)
+	      {
+		sleep (1);
+	      }
+	    ok = !cub_master_running () && ok;
+	  }
       }
     else if (id == "replication_start" && j->repl_started)
       {
@@ -2332,6 +2369,10 @@ namespace
 	string out;
 	ok = reconnect (j, &msg) && remote (j, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
 	     && out.find (": fail") == string::npos;
+	if (ok && !j->m_repl_dir_existed)
+	  {
+	    ok = remote (j, "rm -rf " + shq (slave_log_dir (j, j->m_copy_base)), NULL, 120) == 0;
+	  }
       }
     else if (id == "replica_replication_start")
       {
@@ -2343,9 +2384,14 @@ namespace
 		continue;
 	      }
 	    string out;
-	    ok = reconnect_node (j, (int) k + 1, &msg)
-		 && remote_on (j, (int) k + 1, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
-		 && out.find (": fail") == string::npos && ok;
+	    bool one = reconnect_node (j, (int) k + 1, &msg)
+		       && remote_on (j, (int) k + 1, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
+		       && out.find (": fail") == string::npos;
+	    if (one && !j->reps[k]->repl_dir_existed)
+	      {
+		one = remote_on (j, (int) k + 1, "rm -rf " + shq (slave_log_dir (j, j->reps[k]->copy_base)), NULL, 120) == 0;
+	      }
+	    ok = one && ok;
 	  }
       }
     else if (id == "master_config" || id == "slave_config" || id == "replica_config")
@@ -2382,7 +2428,7 @@ namespace
 		  }
 		if (node >= 0)
 		  {
-		    string cmd = it->existed ? "cp -f " + shq (it->bak) + " " + shq (it->path) : "rm -f " + shq (it->path);
+		    string cmd = it->existed ? "mv -f " + shq (it->bak) + " " + shq (it->path) : "rm -f " + shq (it->path);
 		    ok = remote_on (j, node, cmd, NULL, 60) == 0 && ok;
 		  }
 		else if (it->existed)
@@ -2664,12 +2710,12 @@ ext_ha_check_ssh (Json::Value &request, Json::Value &response)
   else if (want_fp.empty ())
     {
       result = "hostkey_unknown";
-      msg = "confirm the master host key " + c.fp + " and call again with hostkey_sha256";
+      msg = "confirm the host key " + c.fp + " and call again with hostkey_sha256";
     }
   else if (want_fp != c.fp)
     {
       result = "hostkey_mismatch";
-      msg = "the master host key is " + c.fp + ", not " + want_fp;
+      msg = "the host key is " + c.fp + ", not " + want_fp;
     }
   else if (pw.empty ())
     {
@@ -2714,17 +2760,17 @@ ext_ha_check_ssh (Json::Value &request, Json::Value &response)
 	  if (rc < 0)
 	    {
 	      result = "error";
-	      msg = "could not run commands on the master";
+	      msg = "could not run commands on " + host;
 	    }
 	  else if (rel.empty () || response["remote_cubrid"].asString ().empty ())
 	    {
 	      result = "cubrid_not_found";
-	      msg = "CUBRID was not found for " + user + " on the master (login shell environment)";
+	      msg = "CUBRID was not found for " + user + " on " + host + " (login shell environment)";
 	    }
 	  else if (parse_version (rel) != response["local_version"].asString ())
 	    {
 	      result = "version_mismatch";
-	      msg = "master CUBRID " + parse_version (rel) + ", this server " + response["local_version"].asString ();
+	      msg = host + " CUBRID " + parse_version (rel) + ", this server " + response["local_version"].asString ();
 	    }
 	}
     }
