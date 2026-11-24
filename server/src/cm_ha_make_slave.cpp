@@ -1012,6 +1012,7 @@ namespace
     vector<string> kept;
     time_t started = 0, ended = 0;
     std::atomic<bool> cancel {false};
+    std::atomic<bool> rolling_back {false};	/* undo commands must not see the cancel */
   };
 
   std::mutex g_jobs_mu;
@@ -1227,9 +1228,10 @@ namespace
 	  {
 	    break;
 	  }
-	if (!done && term_at == 0 && (j->cancel.load () || (timeout_sec > 0 && time (NULL) - start > timeout_sec)))
+	bool cancelled = j->cancel.load () && !j->rolling_back.load ();
+	if (!done && term_at == 0 && (cancelled || (timeout_sec > 0 && time (NULL) - start > timeout_sec)))
 	  {
-	    result = j->cancel.load () ? -2 : -3;
+	    result = cancelled ? -2 : -3;
 	    killpg (pid, SIGTERM);
 	    term_at = time (NULL);
 	  }
@@ -1304,7 +1306,7 @@ namespace
     return j->ssh.exec (cmd, out, [j] (const string &l)
     {
       job_log (j, "  " + l);
-    }, &j->cancel, timeout_sec);
+    }, j->rolling_back.load () ? NULL : &j->cancel, timeout_sec);
   }
 
   bool reconnect (job_t *j, string *msg)
@@ -1944,6 +1946,12 @@ namespace
 
 #undef FAIL
 
+  bool has_undo (const string &id)
+  {
+    return id == "slave_config" || id == "master_backup" || id == "fetch_backup" || id == "keep_old_db" || id == "restore"
+	   || id == "copylog" || id == "master_config" || id == "replication_start" || id == "slave_ha_start";
+  }
+
   /* undo one finished (or failed) step; true when it is back as before */
   bool rollback_step (job_t *j, const string &id)
   {
@@ -1955,7 +1963,11 @@ namespace
       }
     else if (id == "replication_start" && j->repl_started)
       {
-	ok = reconnect (j, &msg) && remote (j, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", NULL, 300) == 0;
+	/* runs before master_config is undone: replication stop fails once the node is not in ha_node_list,
+	   and the command then still ends with "success", so read the output */
+	string out;
+	ok = reconnect (j, &msg) && remote (j, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
+	     && out.find (": fail") == string::npos;
       }
     else if (id == "master_config" || id == "slave_config")
       {
@@ -2089,6 +2101,7 @@ namespace
 	if (f.error == "cancelled" || j->cancel.load ())
 	  {
 	    f.error = "cancelled";
+	    f.message = "cancelled during " + id + (f.message.empty () || f.message == "cancelled" ? "" : " (" + f.message + ")");
 	  }
 	set_step (j, i, "failed", f.message);
 	job_log (j, "FAILED: " + f.message);
@@ -2111,6 +2124,7 @@ namespace
       j->has_exit_code = f.has_exit;
       j->phase = "rollback";
     }
+    j->rolling_back.store (true);
     save_state (j);
     job_log (j, "rolling back");
     /* the failed step may have changed things too, so it is undone as well */
@@ -2122,7 +2136,7 @@ namespace
 	  std::lock_guard<std::mutex> lg (j->mu);
 	  state = j->steps[i].state;
 	}
-	if (state != "done" && state != "failed")
+	if ((state != "done" && state != "failed") || !has_undo (id))
 	  {
 	    continue;
 	  }
