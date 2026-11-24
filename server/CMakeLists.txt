@@ -200,6 +200,7 @@ set(CUB_MANAGER_SOURCES
   ${CMS_SRC_DIR}/cm_ssl_cert.cpp
   ${CMS_SRC_DIR}/cm_session_ip.cpp
   ${CMS_SRC_DIR}/cm_log_name.cpp
+  ${CMS_SRC_DIR}/cm_ha_make_slave.cpp
   )
 
 add_executable(cm_admin ${CM_ADMIN_SOURCES})
@@ -226,6 +227,12 @@ target_include_directories(cub_manager PRIVATE
 target_link_libraries(cub_manager PRIVATE
   ${CMS_CUBRID_LIBS} ${CMS_EXTERNAL_LIBS} ${CMS_OPENSSL_LIBS}
   Threads::Threads ${CMAKE_DL_LIBS} rt)
+
+# HA slave POC: ssh to the master through libssh (no system ssh/scp)
+find_library(CMS_LIBSSH_LIB NAMES ssh REQUIRED)
+find_path(CMS_LIBSSH_INCLUDE libssh/libssh.h REQUIRED)
+target_include_directories(cub_manager PRIVATE ${CMS_LIBSSH_INCLUDE})
+target_link_libraries(cub_manager PRIVATE ${CMS_LIBSSH_LIB})
 
 # The committed jsoncpp and libevent archives were built without -fPIC, so this has to
 # be a non-PIE executable - which is what the automake build produced as well.

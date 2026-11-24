@@ -42,6 +42,9 @@
 #include "cm_mon_stat.h"
 #include "cm_user.h"
 #include "cm_session_ip.h"
+#if !defined(WINDOWS)
+#include "cm_ha_make_slave.h"
+#endif
 
 #include <fstream>
 #include <sstream>
@@ -89,6 +92,14 @@ static T_EXTEND_TASK_INFO ext_task_info[] =
   {"getserverstatus", 0, ext_get_server_status, AU_ADMIN},
   {"getserverinfo", 0, ext_get_server_info, AU_ANY},
   {"force_logout", 0, ext_force_logout, AU_ADMIN},
+#if !defined(WINDOWS)
+  /* HA slave POC, docs/ha-make-slave-poc-api.md */
+  {"ha_check_ssh", 0, ext_ha_check_ssh, AU_ADMIN},
+  {"ha_make_slave", 0, ext_ha_make_slave, AU_ADMIN},
+  {"ha_make_slave_status", 0, ext_ha_make_slave_status, AU_ADMIN},
+  {"ha_make_slave_cancel", 0, ext_ha_make_slave_cancel, AU_ADMIN},
+  {"ha_make_slave_cleanup", 0, ext_ha_make_slave_cleanup, AU_ADMIN},
+#endif
   {NULL, 0, NULL, 0}
 };
 
