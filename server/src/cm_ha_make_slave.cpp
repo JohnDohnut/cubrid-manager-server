@@ -1,6 +1,6 @@
 /*
  * HA slave POC (plan 2 of the HA slave review): this CMS turns its own server into
- * an HA slave of a running master. Work on the master goes through libssh (command
+ * an HA slave of a running master. Work on the master goes through libssh2 (command
  * execution and SFTP); work on this server runs locally. No ha_make_slavedb.sh, no
  * system ssh/scp. Tasks and steps: docs/ha-make-slave-poc-api.md.
  *
@@ -18,8 +18,8 @@
 #include "cm_server_extend_interface.h"
 #include "cm_ha_make_slave.h"
 
-#include <libssh/libssh.h>
-#include <libssh/sftp.h>
+#include <libssh2.h>
+#include <libssh2_sftp.h>
 #include <openssl/evp.h>
 
 #include <atomic>
@@ -33,6 +33,8 @@
 #include <vector>
 
 #include <dirent.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -423,6 +425,46 @@ namespace
     return value;
   }
 
+  /* key/value pairs of one section, last value wins, in first-seen order */
+  vector<std::pair<string, string>> conf_pairs (const string &content, const string &section)
+  {
+    vector<std::pair<string, string>> out;
+    string cur;
+    for (const string &raw : lines_of (content))
+      {
+	string line = trim (raw);
+	if (line.empty () || line[0] == '#')
+	  {
+	    continue;
+	  }
+	if (line[0] == '[')
+	  {
+	    cur = line;
+	    continue;
+	  }
+	size_t eq = line.find ('=');
+	if (cur != section || eq == string::npos)
+	  {
+	    continue;
+	  }
+	string k = trim (line.substr (0, eq)), v = trim (line.substr (eq + 1));
+	bool found = false;
+	for (auto &kv : out)
+	  {
+	    if (kv.first == k)
+	      {
+		kv.second = v;
+		found = true;
+	      }
+	  }
+	if (!found)
+	  {
+	    out.push_back (std::make_pair (k, v));
+	  }
+      }
+    return out;
+  }
+
   string conf_set (const string &content, const string &section, const string &key, const string &value)
   {
     vector<string> ls = lines_of (content);
@@ -555,12 +597,65 @@ namespace
 
   std::once_flag g_ssh_init_once;
 
+  /* OpenSSH shows SHA256 fingerprints as base64 without '=' padding */
+  string sha256_fingerprint (const unsigned char *hash)
+  {
+    unsigned char b64[64];
+    int n = EVP_EncodeBlock (b64, hash, 32);
+    string s ((const char *) b64, n > 0 ? n : 0);
+    while (!s.empty () && s.back () == '=')
+      {
+	s.pop_back ();
+      }
+    return "SHA256:" + s;
+  }
+
+  const char *hostkey_type_name (int type)
+  {
+    switch (type)
+      {
+      case LIBSSH2_HOSTKEY_TYPE_RSA:
+	return "ssh-rsa";
+      case LIBSSH2_HOSTKEY_TYPE_DSS:
+	return "ssh-dss";
+#ifdef LIBSSH2_HOSTKEY_TYPE_ECDSA_256
+      case LIBSSH2_HOSTKEY_TYPE_ECDSA_256:
+	return "ecdsa-sha2-nistp256";
+      case LIBSSH2_HOSTKEY_TYPE_ECDSA_384:
+	return "ecdsa-sha2-nistp384";
+      case LIBSSH2_HOSTKEY_TYPE_ECDSA_521:
+	return "ecdsa-sha2-nistp521";
+#endif
+#ifdef LIBSSH2_HOSTKEY_TYPE_ED25519
+      case LIBSSH2_HOSTKEY_TYPE_ED25519:
+	return "ssh-ed25519";
+#endif
+      default:
+	return "unknown";
+      }
+  }
+
+  /* keyboard-interactive: answer every prompt with the password kept in the session's abstract */
+  void kbdint_cb (const char *name, int name_len, const char *instruction, int instruction_len, int num_prompts,
+		  const LIBSSH2_USERAUTH_KBDINT_PROMPT *prompts, LIBSSH2_USERAUTH_KBDINT_RESPONSE *responses, void **abstract)
+  {
+    const string *pw = (abstract != NULL) ? (const string *) *abstract : NULL;
+    for (int i = 0; i < num_prompts; i++)
+      {
+	responses[i].text = (pw != NULL) ? strdup (pw->c_str ()) : strdup ("");
+	responses[i].length = (pw != NULL) ? (unsigned int) pw->size () : 0;
+      }
+  }
+
   class ssh_conn
   {
     public:
-      ssh_session s = NULL;
-      sftp_session sf = NULL;
-      string fp, keytype;
+      LIBSSH2_SESSION *s = NULL;
+      LIBSSH2_SFTP *sf = NULL;
+      int sock = -1;
+      bool broken = false;
+      string fp, keytype, user;
+      const string *auth_pw = NULL;	/* only during auth (), read by kbdint_cb */
 
       ~ssh_conn ()
       {
@@ -571,122 +666,195 @@ namespace
       {
 	if (sf != NULL)
 	  {
-	    sftp_free (sf);
+	    libssh2_sftp_shutdown (sf);
 	    sf = NULL;
 	  }
 	if (s != NULL)
 	  {
-	    ssh_disconnect (s);
-	    ssh_free (s);
+	    libssh2_session_disconnect (s, "bye");
+	    libssh2_session_free (s);
 	    s = NULL;
 	  }
+	if (sock >= 0)
+	  {
+	    ::close (sock);
+	    sock = -1;
+	  }
+	broken = false;
       }
 
       bool alive () const
       {
-	return s != NULL && ssh_is_connected (s);
+	return s != NULL && !broken;
+      }
+
+      string last_error ()
+      {
+	char *m = NULL;
+	if (s == NULL)
+	  {
+	    return "no session";
+	  }
+	libssh2_session_last_error (s, &m, NULL, 0);
+	return m ? m : "";
+      }
+
+      /* TCP connect with a timeout */
+      static int tcp_connect (const string &host, int port, int timeout_sec, string *msg)
+      {
+	struct addrinfo hints, *res = NULL;
+	memset (&hints, 0, sizeof (hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	int rc = getaddrinfo (host.c_str (), std::to_string (port).c_str (), &hints, &res);
+	if (rc != 0)
+	  {
+	    *msg = "cannot resolve " + host + ": " + gai_strerror (rc);
+	    return -1;
+	  }
+	int fd = -1;
+	string last = "no address";
+	for (struct addrinfo *a = res; a != NULL && fd < 0; a = a->ai_next)
+	  {
+	    fd = socket (a->ai_family, a->ai_socktype, a->ai_protocol);
+	    if (fd < 0)
+	      {
+		continue;
+	      }
+	    int fl = fcntl (fd, F_GETFL);
+	    fcntl (fd, F_SETFL, fl | O_NONBLOCK);
+	    rc = ::connect (fd, a->ai_addr, a->ai_addrlen);
+	    if (rc != 0 && errno == EINPROGRESS)
+	      {
+		struct pollfd p = { fd, POLLOUT, 0 };
+		rc = poll (&p, 1, timeout_sec * 1000);
+		if (rc == 1)
+		  {
+		    int err = 0;
+		    socklen_t len = sizeof (err);
+		    getsockopt (fd, SOL_SOCKET, SO_ERROR, &err, &len);
+		    rc = err ? -1 : 0;
+		    errno = err;
+		  }
+		else
+		  {
+		    rc = -1;
+		    errno = ETIMEDOUT;
+		  }
+	      }
+	    if (rc != 0)
+	      {
+		last = strerror (errno);
+		::close (fd);
+		fd = -1;
+		continue;
+	      }
+	    fcntl (fd, F_SETFL, fl);
+	  }
+	freeaddrinfo (res);
+	if (fd < 0)
+	  {
+	    *msg = "cannot connect to " + host + ":" + std::to_string (port) + ": " + last;
+	  }
+	return fd;
       }
 
       /* TCP + key exchange; fills fp/keytype. "" on success, else an error code */
-      string connect (const string &host, int port, const string &user, string *msg)
+      string connect (const string &host, int port, const string &u, string *msg)
       {
 	std::call_once (g_ssh_init_once, []
 	{
-	  ssh_init ();
+	  libssh2_init (0);
 	});
 	close ();
-	s = ssh_new ();
+	user = u;
+	sock = tcp_connect (host, port, 10, msg);
+	if (sock < 0)
+	  {
+	    return "unreachable";
+	  }
+	s = libssh2_session_init_ex (NULL, NULL, NULL, (void *) this);
 	if (s == NULL)
 	  {
-	    *msg = "ssh_new failed";
+	    *msg = "cannot create an ssh session";
+	    close ();
 	    return "error";
 	  }
-	long timeout = 10;
-	bool no = false;
-	ssh_options_set (s, SSH_OPTIONS_HOST, host.c_str ());
-	ssh_options_set (s, SSH_OPTIONS_PORT, &port);
-	ssh_options_set (s, SSH_OPTIONS_USER, user.c_str ());
-	ssh_options_set (s, SSH_OPTIONS_TIMEOUT, &timeout);
-	ssh_options_set (s, SSH_OPTIONS_PROCESS_CONFIG, &no);
-	if (ssh_connect (s) != SSH_OK)
+	libssh2_session_set_blocking (s, 1);
+	libssh2_session_set_timeout (s, 60000);	/* no blocking call waits more than 60 s */
+	if (libssh2_session_handshake (s, sock) != 0)
 	  {
-	    *msg = string ("cannot connect to ") + host + ":" + std::to_string (port) + ": " + ssh_get_error (s);
+	    *msg = "ssh handshake with " + host + " failed: " + last_error ();
 	    close ();
 	    return "unreachable";
 	  }
-	ssh_key key = NULL;
-	if (ssh_get_server_publickey (s, &key) != SSH_OK)
+	size_t klen = 0;
+	int ktype = 0;
+	const char *key = libssh2_session_hostkey (s, &klen, &ktype);
+	const char *hash = libssh2_hostkey_hash (s, LIBSSH2_HOSTKEY_HASH_SHA256);
+	if (key == NULL || hash == NULL)
 	  {
-	    *msg = string ("cannot read the host key: ") + ssh_get_error (s);
+	    *msg = "cannot read the host key";
 	    close ();
 	    return "error";
 	  }
-	unsigned char *hash = NULL;
-	size_t hlen = 0;
-	if (ssh_get_publickey_hash (key, SSH_PUBLICKEY_HASH_SHA256, &hash, &hlen) == 0)
-	  {
-	    char *f = ssh_get_fingerprint_hash (SSH_PUBLICKEY_HASH_SHA256, hash, hlen);
-	    if (f != NULL)
-	      {
-		fp = f;
-		ssh_string_free_char (f);
-	      }
-	    ssh_clean_pubkey_hash (&hash);
-	  }
-	const char *kt = ssh_key_type_to_char (ssh_key_type (key));
-	keytype = kt ? kt : "";
-	ssh_key_free (key);
-	if (fp.empty ())
-	  {
-	    *msg = "cannot compute the host key fingerprint";
-	    close ();
-	    return "error";
-	  }
+	fp = sha256_fingerprint ((const unsigned char *) hash);
+	keytype = hostkey_type_name (ktype);
 	return "";
       }
 
       string auth (const string &password, string *msg)
       {
-	int rc = ssh_userauth_none (s, NULL);
-	if (rc == SSH_AUTH_SUCCESS)
+	char *methods = libssh2_userauth_list (s, user.c_str (), (unsigned int) user.size ());
+	if (methods == NULL && libssh2_userauth_authenticated (s))
 	  {
 	    return "";
 	  }
-	int methods = ssh_userauth_list (s, NULL);
-	if (methods & SSH_AUTH_METHOD_PASSWORD)
+	string m = methods ? methods : "";
+	if (m.find ("password") != string::npos
+	    && libssh2_userauth_password (s, user.c_str (), password.c_str ()) == 0)
 	  {
-	    rc = ssh_userauth_password (s, NULL, password.c_str ());
-	    if (rc == SSH_AUTH_SUCCESS)
+	    return "";
+	  }
+	if (m.find ("keyboard-interactive") != string::npos)
+	  {
+	    void **abs = libssh2_session_abstract (s);
+	    *abs = (void *) &password;
+	    int rc = libssh2_userauth_keyboard_interactive (s, user.c_str (), kbdint_cb);
+	    *abs = NULL;
+	    if (rc == 0)
 	      {
 		return "";
 	      }
 	  }
-	if (methods & SSH_AUTH_METHOD_INTERACTIVE)
+	if (m.find ("password") == string::npos && m.find ("keyboard-interactive") == string::npos)
 	  {
-	    rc = ssh_userauth_kbdint (s, NULL, NULL);
-	    for (int round = 0; rc == SSH_AUTH_INFO && round < 5; round++)
-	      {
-		int n = ssh_userauth_kbdint_getnprompts (s);
-		for (int i = 0; i < n; i++)
-		  {
-		    ssh_userauth_kbdint_setanswer (s, i, password.c_str ());
-		  }
-		rc = ssh_userauth_kbdint (s, NULL, NULL);
-	      }
-	    if (rc == SSH_AUTH_SUCCESS)
-	      {
-		return "";
-	      }
-	  }
-	if (!(methods & (SSH_AUTH_METHOD_PASSWORD | SSH_AUTH_METHOD_INTERACTIVE)))
-	  {
-	    *msg = "the server accepts neither password nor keyboard-interactive login";
+	    *msg = "the server accepts neither password nor keyboard-interactive login (" + m + ")";
 	  }
 	else
 	  {
 	    *msg = "login failed (wrong OS user or password)";
 	  }
 	return "auth_failed";
+      }
+
+      void wait_socket (int ms)
+      {
+	int dir = libssh2_session_block_directions (s);
+	struct pollfd p = { sock, 0, 0 };
+	if (dir & LIBSSH2_SESSION_BLOCK_INBOUND)
+	  {
+	    p.events |= POLLIN;
+	  }
+	if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND)
+	  {
+	    p.events |= POLLOUT;
+	  }
+	if (p.events == 0)
+	  {
+	    p.events = POLLIN;
+	  }
+	poll (&p, 1, ms);
       }
 
       /*
@@ -696,35 +864,38 @@ namespace
       int exec (const string &cmd, string *out, const std::function<void (const string &)> &on_line,
 		const std::atomic<bool> *cancel, int timeout_sec)
       {
-	ssh_channel ch = ssh_channel_new (s);
+	LIBSSH2_CHANNEL *ch = libssh2_channel_open_session (s);
 	if (ch == NULL)
 	  {
-	    return -1;
-	  }
-	if (ssh_channel_open_session (ch) != SSH_OK)
-	  {
-	    ssh_channel_free (ch);
+	    broken = true;
 	    return -1;
 	  }
 	/* the redirect applies to the whole command, not to the last command of a pipeline */
 	string full = "bash -lc " + shq ("{ " + cmd + "\n} </dev/null");
-	if (ssh_channel_request_exec (ch, full.c_str ()) != SSH_OK)
+	if (libssh2_channel_exec (ch, full.c_str ()) != 0)
 	  {
-	    ssh_channel_close (ch);
-	    ssh_channel_free (ch);
+	    libssh2_channel_free (ch);
+	    broken = true;
 	    return -1;
 	  }
+	libssh2_session_set_blocking (s, 0);
 	time_t start = time (NULL);
 	string pending;
 	char buf[8192];
 	int result = 0;
 	for (;;)
 	  {
-	    bool got = false;
+	    bool got = false, again = false;
 	    for (int is_err = 0; is_err <= 1; is_err++)
 	      {
-		int n = ssh_channel_read_timeout (ch, buf, sizeof (buf), is_err, is_err ? 0 : 300);
-		if (n == SSH_ERROR)
+		ssize_t n = is_err ? libssh2_channel_read_stderr (ch, buf, sizeof (buf))
+			    : libssh2_channel_read (ch, buf, sizeof (buf));
+		if (n == LIBSSH2_ERROR_EAGAIN)
+		  {
+		    again = true;
+		    continue;
+		  }
+		if (n < 0)
 		  {
 		    result = -1;
 		    break;
@@ -753,38 +924,43 @@ namespace
 	      {
 		break;
 	      }
-	    if (ssh_channel_is_eof (ch) && !got)
+	    if (libssh2_channel_eof (ch) && !got)
 	      {
 		break;
 	      }
 	    if (cancel != NULL && cancel->load ())
 	      {
-		ssh_channel_request_send_signal (ch, "TERM");
+		libssh2_channel_signal_ex (ch, "TERM", 4);
 		result = -2;
 		break;
 	      }
 	    if (timeout_sec > 0 && time (NULL) - start > timeout_sec)
 	      {
-		ssh_channel_request_send_signal (ch, "TERM");
+		libssh2_channel_signal_ex (ch, "TERM", 4);
 		result = -3;
 		break;
+	      }
+	    if (!got && again)
+	      {
+		wait_socket (300);
 	      }
 	  }
 	if (!pending.empty () && on_line)
 	  {
 	    on_line (pending);
 	  }
+	libssh2_session_set_blocking (s, 1);
+	libssh2_channel_close (ch);
 	if (result == 0)
 	  {
-	    ssh_channel_send_eof (ch);
-	    result = ssh_channel_get_exit_status (ch);
-	    if (result < 0)
-	      {
-		result = -1;
-	      }
+	    libssh2_channel_wait_closed (ch);
+	    result = libssh2_channel_get_exit_status (ch);
 	  }
-	ssh_channel_close (ch);
-	ssh_channel_free (ch);
+	else if (result == -1)
+	  {
+	    broken = true;
+	  }
+	libssh2_channel_free (ch);
 	return result;
       }
 
@@ -794,18 +970,12 @@ namespace
 	  {
 	    return true;
 	  }
-	sf = sftp_new (s);
+	sf = libssh2_sftp_init (s);
 	if (sf == NULL)
 	  {
-	    return false;
+	    broken = true;
 	  }
-	if (sftp_init (sf) != SSH_OK)
-	  {
-	    sftp_free (sf);
-	    sf = NULL;
-	    return false;
-	  }
-	return true;
+	return sf != NULL;
       }
 
       /* false on error; *exists=false (and true returned) when the file is missing */
@@ -817,19 +987,19 @@ namespace
 	  {
 	    return false;
 	  }
-	sftp_file f = sftp_open (sf, path.c_str (), O_RDONLY, 0);
+	LIBSSH2_SFTP_HANDLE *f = libssh2_sftp_open (sf, path.c_str (), LIBSSH2_FXF_READ, 0);
 	if (f == NULL)
 	  {
-	    return sftp_get_error (sf) == SSH_FX_NO_SUCH_FILE;
+	    return libssh2_sftp_last_error (sf) == LIBSSH2_FX_NO_SUCH_FILE;
 	  }
 	*exists = true;
 	char buf[16384];
 	ssize_t n;
-	while ((n = sftp_read (f, buf, sizeof (buf))) > 0)
+	while ((n = libssh2_sftp_read (f, buf, sizeof (buf))) > 0)
 	  {
 	    data->append (buf, n);
 	  }
-	sftp_close (f);
+	libssh2_sftp_close (f);
 	return n == 0;
       }
 
@@ -839,7 +1009,9 @@ namespace
 	  {
 	    return false;
 	  }
-	sftp_file f = sftp_open (sf, path.c_str (), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	LIBSSH2_SFTP_HANDLE *f = libssh2_sftp_open (sf, path.c_str (),
+				 LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+				 LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
 	if (f == NULL)
 	  {
 	    return false;
@@ -847,15 +1019,15 @@ namespace
 	size_t off = 0;
 	while (off < data.size ())
 	  {
-	    ssize_t n = sftp_write (f, data.data () + off, std::min ((size_t) 32768, data.size () - off));
+	    ssize_t n = libssh2_sftp_write (f, data.data () + off, std::min ((size_t) 32768, data.size () - off));
 	    if (n <= 0)
 	      {
-		sftp_close (f);
+		libssh2_sftp_close (f);
 		return false;
 	      }
 	    off += n;
 	  }
-	return sftp_close (f) == SSH_OK;
+	return libssh2_sftp_close (f) == 0;
       }
 
       /* regular files in a remote folder with their sizes */
@@ -865,23 +1037,23 @@ namespace
 	  {
 	    return false;
 	  }
-	sftp_dir d = sftp_opendir (sf, dir.c_str ());
+	LIBSSH2_SFTP_HANDLE *d = libssh2_sftp_opendir (sf, dir.c_str ());
 	if (d == NULL)
 	  {
 	    return false;
 	  }
-	sftp_attributes a;
-	while ((a = sftp_readdir (sf, d)) != NULL)
+	char name[1024];
+	LIBSSH2_SFTP_ATTRIBUTES a;
+	int n;
+	while ((n = libssh2_sftp_readdir (d, name, sizeof (name), &a)) > 0)
 	  {
-	    if (a->type == SSH_FILEXFER_TYPE_REGULAR)
+	    if ((a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) && LIBSSH2_SFTP_S_ISREG (a.permissions))
 	      {
-		files->push_back (std::make_pair (string (a->name), (uint64_t) a->size));
+		files->push_back (std::make_pair (string (name, n), (uint64_t) a.filesize));
 	      }
-	    sftp_attributes_free (a);
 	  }
-	bool ok = sftp_dir_eof (d);
-	sftp_closedir (d);
-	return ok;
+	libssh2_sftp_closedir (d);
+	return n == 0;
       }
 
       bool stat_size (const string &path, uint64_t *size)
@@ -890,13 +1062,12 @@ namespace
 	  {
 	    return false;
 	  }
-	sftp_attributes a = sftp_stat (sf, path.c_str ());
-	if (a == NULL)
+	LIBSSH2_SFTP_ATTRIBUTES a;
+	if (libssh2_sftp_stat (sf, path.c_str (), &a) != 0 || !(a.flags & LIBSSH2_SFTP_ATTR_SIZE))
 	  {
 	    return false;
 	  }
-	*size = a->size;
-	sftp_attributes_free (a);
+	*size = a.filesize;
 	return true;
       }
 
@@ -906,7 +1077,7 @@ namespace
       {
 	if (!sftp_ready ())
 	  {
-	    *msg = "SFTP is not available";
+	    *msg = "SFTP is not available: " + last_error ();
 	    return false;
 	  }
 	struct stat st;
@@ -920,29 +1091,27 @@ namespace
 	  {
 	    return true;
 	  }
-	sftp_file f = sftp_open (sf, remote.c_str (), O_RDONLY, 0);
+	LIBSSH2_SFTP_HANDLE *f = libssh2_sftp_open (sf, remote.c_str (), LIBSSH2_FXF_READ, 0);
 	if (f == NULL)
 	  {
-	    *msg = "cannot open " + remote + ": " + ssh_get_error (s);
+	    *msg = "cannot open " + remote + ": " + last_error ();
 	    return false;
 	  }
-	if (have > 0 && sftp_seek64 (f, have) != 0)
+	if (have > 0)
 	  {
-	    sftp_close (f);
-	    *msg = "cannot resume " + remote;
-	    return false;
+	    libssh2_sftp_seek64 (f, have);
 	  }
 	int fd = open (local.c_str (), O_WRONLY | O_CREAT | (have > 0 ? O_APPEND : O_TRUNC), 0600);
 	if (fd < 0)
 	  {
-	    sftp_close (f);
+	    libssh2_sftp_close (f);
 	    *msg = "cannot write " + local + ": " + strerror (errno);
 	    return false;
 	  }
 	char buf[65536];
 	ssize_t n;
 	bool ok = true;
-	while ((n = sftp_read (f, buf, sizeof (buf))) > 0)
+	while ((n = libssh2_sftp_read (f, buf, sizeof (buf))) > 0)
 	  {
 	    if (write (fd, buf, n) != n)
 	      {
@@ -959,11 +1128,12 @@ namespace
 	  }
 	if (n < 0)
 	  {
-	    *msg = "read failed on " + remote + ": " + ssh_get_error (s);
+	    *msg = "read failed on " + remote + ": " + last_error ();
+	    broken = true;
 	    ok = false;
 	  }
 	::close (fd);
-	sftp_close (f);
+	libssh2_sftp_close (f);
 	return ok;
       }
   };
@@ -977,9 +1147,23 @@ namespace
 
   struct edit_t
   {
-    bool remote;
+    int node;			/* -1 this server, 0 the master, k>0 replica k-1 */
     string path, bak;
     bool existed;
+  };
+
+  /* a replica the new slave has to be added to (M-R -> M-S-R) */
+  struct rep_t
+  {
+    string host, user, fp, pw;
+    int port = 22;
+    ssh_conn ssh;
+    string cubrid, dbs, version;
+    bool reloaded = false, repl_started = false;
+    ~rep_t ()
+    {
+      wipe (pw);
+    }
   };
 
   struct job_t
@@ -993,7 +1177,8 @@ namespace
     /* only the job thread touches these */
     string pw;
     ssh_conn ssh;
-    string m_cubrid, m_dbs, m_version, m_node_list, m_port_id, m_db_list, m_sync_mode;
+    string m_cubrid, m_dbs, m_version, m_node_list, m_port_id, m_db_list, m_sync_mode, m_replica_list, m_haconf;
+    vector<std::unique_ptr<rep_t>> reps;
     vector<string> m_db_line, s_db_line;
     string m_bk_dir, s_bk_dir, repl_dir;
     vector<edit_t> edits;
@@ -1025,15 +1210,18 @@ namespace
     {"precheck", "Check this server"},
     {"connect", "Connect to the master over ssh"},
     {"master_check", "Check the master"},
+    {"replica_check", "Connect to and check the replicas"},
     {"slave_config", "Prepare this server's HA settings"},
     {"master_backup", "Back up the master database online"},
     {"fetch_backup", "Fetch the backup"},
     {"keep_old_db", "Keep the old slave database aside"},
     {"restore", "Restore as a slave"},
     {"copylog", "First copy of the replication log"},
+    {"slave_ha_start", "Start HA on this server"},
     {"master_config", "Add this server to the master's HA settings"},
     {"replication_start", "Start replication on the master"},
-    {"slave_ha_start", "Start HA on this server"},
+    {"replica_config", "Add this server to the replicas' HA settings"},
+    {"replica_replication_start", "Start replication on the replicas"},
     {"verify", "Check that this server is standby"},
     {"cleanup", "Remove the backup files"},
   };
@@ -1058,6 +1246,12 @@ namespace
     v["db_name"] = j->db;
     v["master_host"] = j->master;
     v["slave_host"] = j->slave;
+    Json::Value rh (Json::arrayValue);
+    for (auto &r : j->reps)
+      {
+	rh.append (r->host);
+      }
+    v["replica_hosts"] = rh;
     v["job_status"] = j->status;
     v["phase"] = j->phase;
     v["error"] = j->error;
@@ -1112,7 +1306,7 @@ namespace
     for (auto &e : j->edits)
       {
 	Json::Value x;
-	x["node"] = e.remote ? "master" : "slave";
+	x["node"] = e.node < 0 ? string ("slave") : e.node == 0 ? string ("master") : "replica " + j->reps[e.node - 1]->host;
 	x["path"] = e.path;
 	x["bak"] = e.existed ? e.bak : "";
 	edits.append (x);
@@ -1300,48 +1494,85 @@ namespace
 
   /* ------------------------------------------------------------ remote helpers */
 
-  int remote (job_t *j, const string &cmd, string *out, int timeout_sec)
+  ssh_conn &node_ssh (job_t *j, int node)
   {
-    job_log (j, "master$ " + cmd);
-    return j->ssh.exec (cmd, out, [j] (const string &l)
+    return node == 0 ? j->ssh : j->reps[node - 1]->ssh;
+  }
+
+  string node_label (job_t *j, int node)
+  {
+    return node < 0 ? string ("") : node == 0 ? string ("master") : "replica " + j->reps[node - 1]->host;
+  }
+
+  int remote_on (job_t *j, int node, const string &cmd, string *out, int timeout_sec)
+  {
+    job_log (j, node_label (j, node) + "$ " + cmd);
+    return node_ssh (j, node).exec (cmd, out, [j] (const string &l)
     {
       job_log (j, "  " + l);
     }, j->rolling_back.load () ? NULL : &j->cancel, timeout_sec);
   }
 
-  bool reconnect (job_t *j, string *msg)
+  int remote (job_t *j, const string &cmd, string *out, int timeout_sec)
   {
-    if (j->ssh.alive ())
-      {
-	return true;
-      }
-    string err = j->ssh.connect (j->master, j->port, j->user, msg);
-    if (!err.empty ())
-      {
-	return false;
-      }
-    if (j->ssh.fp != j->fp)
-      {
-	*msg = "the master host key changed: " + j->ssh.fp;
-	j->ssh.close ();
-	return false;
-      }
-    err = j->ssh.auth (j->pw, msg);
-    if (!err.empty ())
-      {
-	j->ssh.close ();
-	return false;
-      }
-    return true;
+    return remote_on (j, 0, cmd, out, timeout_sec);
   }
 
-  /* edit one file (local or on the master): keep path.bak.<uuid>, write the new content in place */
-  bool edit_file (job_t *j, bool on_master, const string &path, const std::function<string (const string &)> &change,
+  /* connect (or check the connection) to a node: host key must still be the confirmed one */
+  string login_node (job_t *j, int node, string *msg)
+  {
+    ssh_conn &c = node_ssh (j, node);
+    if (c.alive ())
+      {
+	return "";
+      }
+    const string &host = node == 0 ? j->master : j->reps[node - 1]->host;
+    const string &user = node == 0 ? j->user : j->reps[node - 1]->user;
+    const string &fp = node == 0 ? j->fp : j->reps[node - 1]->fp;
+    const string &pw = node == 0 ? j->pw : j->reps[node - 1]->pw;
+    int port = node == 0 ? j->port : j->reps[node - 1]->port;
+    string err = c.connect (host, port, user, msg);
+    if (!err.empty ())
+      {
+	*msg = node_label (j, node) + ": " + *msg;
+	return err == "unreachable" ? "unreachable" : "internal";
+      }
+    if (c.fp != fp)
+      {
+	*msg = node_label (j, node) + ": the host key is " + c.fp + ", not the confirmed " + fp;
+	c.close ();
+	return "hostkey_mismatch";
+      }
+    err = c.auth (pw, msg);
+    if (!err.empty ())
+      {
+	*msg = node_label (j, node) + ": " + *msg;
+	c.close ();
+	return "auth_failed";
+      }
+    job_log (j, "logged in to " + user + "@" + host + " (" + c.keytype + " " + c.fp + ")");
+    return "";
+  }
+
+  bool reconnect_node (job_t *j, int node, string *msg)
+  {
+    return login_node (j, node, msg).empty ();
+  }
+
+  bool reconnect (job_t *j, string *msg)
+  {
+    return reconnect_node (j, 0, msg);
+  }
+
+  /* edit one file (node -1 local, 0 master, k replica): keep path.bak.<uuid>, write the new content in place */
+  bool edit_file (job_t *j, int node, const string &path, const std::function<string (const string &)> &change,
 		  string *msg)
   {
+    bool on_remote = node >= 0;
+    string where = on_remote ? node_label (j, node) + ": " : "";
     string data;
     bool exists = false;
-    bool ok = on_master ? j->ssh.read_file (path, &data, &exists) : read_local_file (path, &data, &exists);
+    bool ok = on_remote ? node_ssh (j, node).read_file (path, &data, &exists) : read_local_file (path, &data, &exists);
     if (!ok)
       {
 	*msg = "cannot read " + path;
@@ -1350,17 +1581,17 @@ namespace
     string next = change (data);
     if (next == data && exists)
       {
-	job_log (j, string (on_master ? "master: " : "") + path + " already has the values");
+	job_log (j, where + path + " already has the values");
 	return true;
       }
     edit_t e;
-    e.remote = on_master;
+    e.node = node;
     e.path = path;
     e.bak = path + ".bak." + j->uuid;
     e.existed = exists;
     if (exists)
       {
-	ok = on_master ? j->ssh.write_file (e.bak, data) : write_local_file (e.bak, data);
+	ok = on_remote ? node_ssh (j, node).write_file (e.bak, data) : write_local_file (e.bak, data);
 	if (!ok)
 	  {
 	    *msg = "cannot write " + e.bak;
@@ -1369,10 +1600,10 @@ namespace
       }
     j->edits.push_back (e);
     save_state (j);
-    if (on_master)
+    if (on_remote)
       {
 	string tmp = path + ".tmp." + j->uuid;
-	ok = j->ssh.write_file (tmp, next) && remote (j, "mv -f " + shq (tmp) + " " + shq (path), NULL, 30) == 0;
+	ok = node_ssh (j, node).write_file (tmp, next) && remote_on (j, node, "mv -f " + shq (tmp) + " " + shq (path), NULL, 30) == 0;
       }
     else
       {
@@ -1383,13 +1614,15 @@ namespace
 	*msg = "cannot write " + path;
 	return false;
       }
-    job_log (j, string (on_master ? "master: " : "") + "edited " + path + (exists ? " (kept " + e.bak + ")" : " (new)"));
+    job_log (j, where + "edited " + path + (exists ? " (kept " + e.bak + ")" : " (new)"));
     return true;
   }
 
   /* ------------------------------------------------------------ steps */
 
 #define FAIL(code, text) do { f->error = (code); f->message = (text); return false; } while (0)
+
+  bool add_slave_to_node (job_t *j, int node, const string &cubrid, const string &dbs, bool *reloaded, step_fail *f);
 
   bool st_precheck (job_t *j, step_fail *f)
   {
@@ -1421,8 +1654,9 @@ namespace
 	read_local_file (j->cubrid + "/conf/cubrid.conf", &conf, &ex);
 	if (conf_get (conf, "[common]", "ha_mode") != "on" && cub_master_running ())
 	  {
-	    FAIL ("precheck_failed", "cub_master is running without HA on this server, so heartbeat start would fail. "
-		  "Stop the CUBRID service here (keep only the manager running), or use start_ha=no");
+	    FAIL ("precheck_failed", "cub_master is running on this server with HA off, so cubrid heartbeat start would fail. "
+		  "CMS cannot stop the service or cub_master (stopping the service stops CMS too). On this server run "
+		  "'cubrid service stop' and then 'cubrid manager start', and try again (or use start_ha=no)");
 	  }
       }
     mkdir_p (j->state_dir);
@@ -1433,23 +1667,11 @@ namespace
   bool st_connect (job_t *j, step_fail *f)
   {
     string msg;
-    string err = j->ssh.connect (j->master, j->port, j->user, &msg);
+    string err = login_node (j, 0, &msg);
     if (!err.empty ())
       {
-	FAIL (err == "unreachable" ? "unreachable" : "internal", msg);
+	FAIL (err, msg);
       }
-    if (j->ssh.fp != j->fp)
-      {
-	j->ssh.close ();
-	FAIL ("hostkey_mismatch", "the master host key is " + j->ssh.fp + ", not the confirmed " + j->fp);
-      }
-    err = j->ssh.auth (j->pw, &msg);
-    if (!err.empty ())
-      {
-	j->ssh.close ();
-	FAIL ("auth_failed", msg);
-      }
-    job_log (j, "logged in to " + j->user + "@" + j->master + " (" + j->ssh.keytype + " " + j->ssh.fp + ")");
     return true;
   }
 
@@ -1497,6 +1719,27 @@ namespace
     j->m_port_id = conf_get (ha, "[common]", "ha_port_id");
     j->m_db_list = conf_get (ha, "[common]", "ha_db_list");
     j->m_sync_mode = conf_get (ha, "[common]", "ha_copy_sync_mode");
+    j->m_replica_list = conf_get (ha, "[common]", "ha_replica_list");
+    j->m_haconf = ha;
+    {
+      vector<string> mr = j->m_replica_list.empty () ? vector<string> () : node_list_hosts (j->m_replica_list);
+      vector<string> asked;
+      for (auto &r : j->reps)
+	{
+	  asked.push_back (r->host);
+	  if (!contains (mr, r->host))
+	    {
+	      FAIL ("precheck_failed", "replica " + r->host + " is not in the master's ha_replica_list (" + j->m_replica_list + ")");
+	    }
+	}
+      for (const string &h : mr)
+	{
+	  if (!contains (asked, h))
+	    {
+	      FAIL ("precheck_failed", "the master's ha_replica_list has " + h + "; pass it in replicas so it learns the new slave too");
+	    }
+	}
+    }
     if (j->m_node_list.empty () || !contains (node_list_hosts (j->m_node_list), j->master))
       {
 	FAIL ("precheck_failed", "the master's ha_node_list (" + j->m_node_list + ") does not have " + j->master);
@@ -1530,15 +1773,18 @@ namespace
   {
     string msg;
     string conf = j->cubrid + "/conf/cubrid.conf";
-    if (!edit_file (j, false, conf, [] (const string &c)
+    if (!edit_file (j, -1, conf, [] (const string &c)
     {
-      return conf_get (c, "[common]", "ha_mode") == "on" ? c : conf_set (c, "[common]", "ha_mode", "on");
+      string n = conf_get (c, "[common]", "ha_mode") == "on" ? c : conf_set (c, "[common]", "ha_mode", "on");
+      /* manual (HA, adding a slave): keep logs that are not replicated yet */
+      return conf_get (n, "[common]", "force_remove_log_archives") == "no" ? n
+	     : conf_set (n, "[common]", "force_remove_log_archives", "no");
       }, &msg))
       {
 	FAIL ("config_edit_failed", msg);
       }
     string haconf = j->cubrid + "/conf/cubrid_ha.conf";
-    if (!edit_file (j, false, haconf, [j] (const string &c)
+    if (!edit_file (j, -1, haconf, [j] (const string &c)
     {
       bool ch;
       string list = node_list_add (j->m_node_list, j->slave, &ch);
@@ -1549,9 +1795,14 @@ namespace
 	    dbs.push_back (j->db);
 	  }
 	string n = conf_set (c, "[common]", "ha_mode", "on");
-	if (!j->m_port_id.empty ())
+	/* the rest of the HA settings as on the master (ha_port_id, ha_replica_list, ha_apply_max_mem_size, ...) */
+	for (auto &kv : conf_pairs (j->m_haconf, "[common]"))
 	  {
-	    n = conf_set (n, "[common]", "ha_port_id", j->m_port_id);
+	    if (kv.first != "ha_node_list" && kv.first != "ha_db_list" && kv.first != "ha_copy_sync_mode"
+		&& kv.first != "ha_copy_log_base")
+	      {
+		n = conf_set (n, "[common]", kv.first, kv.second);
+	      }
 	  }
 	n = conf_set (n, "[common]", "ha_node_list", list);
 	n = conf_set (n, "[common]", "ha_db_list", join (dbs, ","));
@@ -1596,7 +1847,7 @@ namespace
 	  }
       }
     want[2] = join (ordered, ":");
-    if (!edit_file (j, false, dbtxt_path, [&] (const string &c)
+    if (!edit_file (j, -1, dbtxt_path, [&] (const string &c)
     {
       return dbtxt_line (c, j->db) == want ? c : dbtxt_put (c, j->db, want);
       }, &msg))
@@ -1822,60 +2073,7 @@ namespace
 
   bool st_master_config (job_t *j, step_fail *f)
   {
-    string msg;
-    if (!reconnect (j, &msg))
-      {
-	FAIL ("unreachable", msg);
-      }
-    if (!edit_file (j, true, j->m_cubrid + "/conf/cubrid_ha.conf", [j] (const string &c)
-    {
-      bool ch;
-      string list = node_list_add (conf_get (c, "[common]", "ha_node_list"), j->slave, &ch);
-	string n = ch ? conf_set (c, "[common]", "ha_node_list", list) : c;
-	string mode = conf_get (n, "[common]", "ha_copy_sync_mode");
-	string sync = sync_mode_for (mode, node_list_hosts (list).size ());
-	return sync != mode ? conf_set (n, "[common]", "ha_copy_sync_mode", sync) : n;
-      }, &msg))
-      {
-	FAIL ("config_edit_failed", msg);
-      }
-    if (!edit_file (j, true, j->m_dbs + "/databases.txt", [j] (const string &c)
-    {
-      vector<string> t = dbtxt_line (c, j->db);
-	if (t.size () < 4)
-	  {
-	    return c;
-	  }
-	vector<string> hosts = split_any (t[2], ":");
-	if (contains (hosts, j->slave))
-	  {
-	    return c;
-	  }
-	hosts.push_back (j->slave);
-	t[2] = join (hosts, ":");
-	return dbtxt_put (c, j->db, t);
-      }, &msg))
-      {
-	FAIL ("config_edit_failed", msg);
-      }
-    string ha;
-    bool ex = false;
-    j->ssh.read_file (j->m_cubrid + "/conf/cubrid_ha.conf", &ha, &ex);
-    if (!contains (node_list_hosts (conf_get (ha, "[common]", "ha_node_list")), j->slave))
-      {
-	FAIL ("config_edit_failed", "the master's ha_node_list did not read back with " + j->slave);
-      }
-    string out;
-    int rc = remote (j, "cubrid heartbeat reload 2>&1", &out, 300);
-    j->reloaded = true;
-    save_state (j);
-    if (rc != 0 || out.find ("fail") != string::npos)
-      {
-	f->exit_code = rc;
-	f->has_exit = rc > 0;
-	FAIL ("command_failed", "cubrid heartbeat reload on the master failed: " + trim (out));
-      }
-    return true;
+    return add_slave_to_node (j, 0, j->m_cubrid, j->m_dbs, &j->reloaded, f);
   }
 
   bool st_replication_start (job_t *j, step_fail *f)
@@ -1944,12 +2142,178 @@ namespace
     return true;
   }
 
+  bool st_replica_check (job_t *j, step_fail *f)
+  {
+    if (j->reps.empty ())
+      {
+	job_log (j, "no replicas");
+	return true;
+      }
+    for (size_t k = 0; k < j->reps.size (); k++)
+      {
+	rep_t *r = j->reps[k].get ();
+	int node = (int) k + 1;
+	string msg;
+	string err = login_node (j, node, &msg);
+	if (!err.empty ())
+	  {
+	    FAIL (err, msg);
+	  }
+	string out;
+	int rc = remote_on (j, node, "echo \"CUBRID=$CUBRID\"; echo \"CUBRID_DATABASES=$CUBRID_DATABASES\"; "
+			    "\"$CUBRID/bin/cubrid_rel\" | grep -m1 CUBRID", &out, 60);
+	for (const string &l : lines_of (out))
+	  {
+	    if (l.compare (0, 7, "CUBRID=") == 0)
+	      {
+		r->cubrid = l.substr (7);
+	      }
+	    else if (l.compare (0, 17, "CUBRID_DATABASES=") == 0)
+	      {
+		r->dbs = l.substr (17);
+	      }
+	    else if (l.find ("CUBRID ") == 0 && r->version.empty ())
+	      {
+		r->version = parse_version (l);
+	      }
+	  }
+	if (rc != 0 || r->cubrid.empty () || r->version.empty ())
+	  {
+	    FAIL ("precheck_failed", "CUBRID was not found for " + r->user + " on replica " + r->host);
+	  }
+	if (r->version != j->local_version)
+	  {
+	    FAIL ("version_mismatch", "replica " + r->host + " CUBRID " + r->version + ", this server " + j->local_version);
+	  }
+	out.clear ();
+	remote_on (j, node, "cubrid changemode " + shq (j->db + "@localhost") + " 2>&1", &out, 60);
+	if (out.find ("is standby") == string::npos)
+	  {
+	    FAIL ("precheck_failed", "database " + j->db + " on replica " + r->host + " is not running as standby: " + trim (out));
+	  }
+	string ha;
+	bool ex = false;
+	if (!r->ssh.read_file (r->cubrid + "/conf/cubrid_ha.conf", &ha, &ex) || !ex)
+	  {
+	    FAIL ("precheck_failed", "cannot read cubrid_ha.conf on replica " + r->host);
+	  }
+	if (!contains (split_any (conf_get (ha, "[common]", "ha_db_list"), " ,:"), j->db)
+	    || !contains (node_list_hosts (conf_get (ha, "[common]", "ha_node_list")), j->master))
+	  {
+	    FAIL ("precheck_failed", "replica " + r->host + " is not replicating " + j->db + " from " + j->master);
+	  }
+	job_log (j, "replica " + r->host + ": CUBRID " + r->version + ", " + j->db + " is standby");
+      }
+    return true;
+  }
+
+  /* procedure 6 and 8 on one remote node (master or a replica): ha_node_list (+ ha_copy_sync_mode), databases.txt, reload */
+  bool add_slave_to_node (job_t *j, int node, const string &cubrid, const string &dbs, bool *reloaded, step_fail *f)
+  {
+    string msg;
+    if (!reconnect_node (j, node, &msg))
+      {
+	FAIL ("unreachable", msg);
+      }
+    if (!edit_file (j, node, cubrid + "/conf/cubrid_ha.conf", [j] (const string &c)
+    {
+      bool ch;
+      string list = node_list_add (conf_get (c, "[common]", "ha_node_list"), j->slave, &ch);
+	string n = ch ? conf_set (c, "[common]", "ha_node_list", list) : c;
+	string mode = conf_get (n, "[common]", "ha_copy_sync_mode");
+	string sync = sync_mode_for (mode, node_list_hosts (list).size ());
+	return sync != mode ? conf_set (n, "[common]", "ha_copy_sync_mode", sync) : n;
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    if (!edit_file (j, node, dbs + "/databases.txt", [j] (const string &c)
+    {
+      vector<string> t = dbtxt_line (c, j->db);
+	if (t.size () < 4)
+	  {
+	    return c;
+	  }
+	vector<string> hosts = split_any (t[2], ":");
+	if (contains (hosts, j->slave))
+	  {
+	    return c;
+	  }
+	hosts.push_back (j->slave);
+	t[2] = join (hosts, ":");
+	return dbtxt_put (c, j->db, t);
+      }, &msg))
+      {
+	FAIL ("config_edit_failed", msg);
+      }
+    string ha;
+    bool ex = false;
+    node_ssh (j, node).read_file (cubrid + "/conf/cubrid_ha.conf", &ha, &ex);
+    if (!contains (node_list_hosts (conf_get (ha, "[common]", "ha_node_list")), j->slave))
+      {
+	FAIL ("config_edit_failed", node_label (j, node) + ": ha_node_list did not read back with " + j->slave);
+      }
+    string out;
+    int rc = remote_on (j, node, "cubrid heartbeat reload 2>&1", &out, 300);
+    *reloaded = true;
+    save_state (j);
+    if (rc != 0 || out.find ("fail") != string::npos)
+      {
+	f->exit_code = rc;
+	f->has_exit = rc > 0;
+	FAIL ("command_failed", node_label (j, node) + ": cubrid heartbeat reload failed: " + trim (out));
+      }
+    return true;
+  }
+
+  bool st_replica_config (job_t *j, step_fail *f)
+  {
+    for (size_t k = 0; k < j->reps.size (); k++)
+      {
+	rep_t *r = j->reps[k].get ();
+	if (!add_slave_to_node (j, (int) k + 1, r->cubrid, r->dbs, &r->reloaded, f))
+	  {
+	    return false;
+	  }
+      }
+    if (j->reps.empty ())
+      {
+	job_log (j, "no replicas");
+      }
+    return true;
+  }
+
+  bool st_replica_replication_start (job_t *j, step_fail *f)
+  {
+    for (size_t k = 0; k < j->reps.size (); k++)
+      {
+	rep_t *r = j->reps[k].get ();
+	string out;
+	r->repl_started = true;
+	save_state (j);
+	int rc = remote_on (j, (int) k + 1, "cubrid heartbeat replication start " + shq (j->slave) + " 2>&1", &out, 300);
+	if (rc != 0 || out.find ("fail") != string::npos)
+	  {
+	    f->exit_code = rc;
+	    f->has_exit = rc > 0;
+	    FAIL (rc == -2 ? "cancelled" : "command_failed",
+		  "replica " + r->host + ": cubrid heartbeat replication start failed: " + trim (out));
+	  }
+      }
+    if (j->reps.empty ())
+      {
+	job_log (j, "no replicas");
+      }
+    return true;
+  }
+
 #undef FAIL
 
   bool has_undo (const string &id)
   {
     return id == "slave_config" || id == "master_backup" || id == "fetch_backup" || id == "keep_old_db" || id == "restore"
-	   || id == "copylog" || id == "master_config" || id == "replication_start" || id == "slave_ha_start";
+	   || id == "copylog" || id == "master_config" || id == "replication_start" || id == "slave_ha_start"
+	   || id == "replica_config" || id == "replica_replication_start";
   }
 
   /* undo one finished (or failed) step; true when it is back as before */
@@ -1969,37 +2333,73 @@ namespace
 	ok = reconnect (j, &msg) && remote (j, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
 	     && out.find (": fail") == string::npos;
       }
-    else if (id == "master_config" || id == "slave_config")
+    else if (id == "replica_replication_start")
       {
-	bool on_master = (id == "master_config");
-	if (on_master && !reconnect (j, &msg))
+	/* before replica_config is undone, for the same reason as replication_start */
+	for (size_t k = 0; k < j->reps.size (); k++)
 	  {
-	    return false;
-	  }
-	for (auto it = j->edits.rbegin (); it != j->edits.rend (); ++it)
-	  {
-	    if (it->remote != on_master)
+	    if (!j->reps[k]->repl_started)
 	      {
 		continue;
 	      }
-	    if (on_master)
-	      {
-		string cmd = it->existed ? "cp -f " + shq (it->bak) + " " + shq (it->path) : "rm -f " + shq (it->path);
-		ok = remote (j, cmd, NULL, 60) == 0 && ok;
-	      }
-	    else if (it->existed)
-	      {
-		ok = rename (it->bak.c_str (), it->path.c_str ()) == 0 && ok;
-	      }
-	    else
-	      {
-		ok = unlink (it->path.c_str ()) == 0 && ok;
-	      }
-	    job_log (j, string (on_master ? "master: " : "") + "restored " + it->path);
+	    string out;
+	    ok = reconnect_node (j, (int) k + 1, &msg)
+		 && remote_on (j, (int) k + 1, "cubrid heartbeat replication stop " + shq (j->slave) + " 2>&1", &out, 300) == 0
+		 && out.find (": fail") == string::npos && ok;
 	  }
-	if (on_master && j->reloaded)
+      }
+    else if (id == "master_config" || id == "slave_config" || id == "replica_config")
+      {
+	/* nodes whose files this step edited: -1 this server, 0 the master, k>0 replicas */
+	vector<int> nodes;
+	if (id == "slave_config")
 	  {
-	    ok = remote (j, "cubrid heartbeat reload 2>&1", NULL, 300) == 0 && ok;
+	    nodes.push_back (-1);
+	  }
+	else if (id == "master_config")
+	  {
+	    nodes.push_back (0);
+	  }
+	else
+	  {
+	    for (size_t k = 0; k < j->reps.size (); k++)
+	      {
+		nodes.push_back ((int) k + 1);
+	      }
+	  }
+	for (int node : nodes)
+	  {
+	    if (node >= 0 && !reconnect_node (j, node, &msg))
+	      {
+		ok = false;
+		continue;
+	      }
+	    for (auto it = j->edits.rbegin (); it != j->edits.rend (); ++it)
+	      {
+		if (it->node != node)
+		  {
+		    continue;
+		  }
+		if (node >= 0)
+		  {
+		    string cmd = it->existed ? "cp -f " + shq (it->bak) + " " + shq (it->path) : "rm -f " + shq (it->path);
+		    ok = remote_on (j, node, cmd, NULL, 60) == 0 && ok;
+		  }
+		else if (it->existed)
+		  {
+		    ok = rename (it->bak.c_str (), it->path.c_str ()) == 0 && ok;
+		  }
+		else
+		  {
+		    ok = unlink (it->path.c_str ()) == 0 && ok;
+		  }
+		job_log (j, (node >= 0 ? node_label (j, node) + ": " : string ("")) + "restored " + it->path);
+	      }
+	    bool reloaded = node == 0 ? j->reloaded : node > 0 ? j->reps[node - 1]->reloaded : false;
+	    if (reloaded)
+	      {
+		ok = remote_on (j, node, "cubrid heartbeat reload 2>&1", NULL, 300) == 0 && ok;
+	      }
 	  }
       }
     else if (id == "copylog" && !j->repl_dir.empty ())
@@ -2044,6 +2444,11 @@ namespace
   {
     wipe (j->pw);
     j->ssh.close ();
+    for (auto &r : j->reps)
+      {
+	wipe (r->pw);
+	r->ssh.close ();
+      }
     {
       std::lock_guard<std::mutex> lg (j->mu);
       j->status = status;
@@ -2057,10 +2462,12 @@ namespace
   {
     job_t *j = jp.get ();
     typedef bool (*step_fn) (job_t *, step_fail *);
-    step_fn fns[] = { st_precheck, st_connect, st_master_check, st_slave_config, st_master_backup, st_fetch_backup,
-		      st_keep_old_db, st_restore, st_copylog, st_master_config, st_replication_start, st_slave_ha_start,
-		      st_verify, st_cleanup
+    /* order of STEP_DEFS; as in the manual, this server's HA starts before the others add it */
+    step_fn fns[] = { st_precheck, st_connect, st_master_check, st_replica_check, st_slave_config, st_master_backup,
+		      st_fetch_backup, st_keep_old_db, st_restore, st_copylog, st_slave_ha_start, st_master_config,
+		      st_replication_start, st_replica_config, st_replica_replication_start, st_verify, st_cleanup
 		    };
+    static_assert (sizeof (fns) / sizeof (fns[0]) == sizeof (STEP_DEFS) / sizeof (STEP_DEFS[0]), "one function per step");
     int failed_at = -1;
     step_fail f;
     f.exit_code = -1;
@@ -2396,10 +2803,60 @@ ext_ha_make_slave (Json::Value &request, Json::Value &response)
       wipe (pw);
       return fail_resp (response, "invalid or missing " + bad);
     }
-  if (request["replicas"].isArray () && request["replicas"].size () > 0)
+  if (!request["replicas"].isNull () && !request["replicas"].isArray ())
     {
       wipe (pw);
-      return fail_resp (response, "replicas are not supported in this POC");
+      return fail_resp (response, "replicas must be an array");
+    }
+  for (Json::UInt i = 0; request["replicas"].isArray () && i < request["replicas"].size (); i++)
+    {
+      Json::Value &e = request["replicas"][i];
+      std::unique_ptr<rep_t> r (new rep_t ());
+      if (e.isObject ())
+	{
+	  r->pw = take_password (e);
+	  r->host = req_str (e, "host");
+	  r->user = req_str (e, "os_user");
+	  r->fp = req_str (e, "hostkey_sha256");
+	}
+      string what = "replicas[" + std::to_string (i) + "].";
+      if (!e.isObject () || !valid_name (r->host))
+	{
+	  bad = what + "host";
+	}
+      else if (!valid_name (r->user))
+	{
+	  bad = what + "os_user";
+	}
+      else if (r->fp.compare (0, 7, "SHA256:") != 0)
+	{
+	  bad = what + "hostkey_sha256";
+	}
+      else if (!parse_port (req_str (e, "ssh_port", "22"), &r->port))
+	{
+	  bad = what + "ssh_port";
+	}
+      else if (r->pw.empty ())
+	{
+	  bad = what + "os_password";
+	}
+      else if (r->host == j->master || r->host == j->slave)
+	{
+	  bad = what + "host (same as master_host or slave_host)";
+	}
+      for (auto &o : j->reps)
+	{
+	  if (o->host == r->host)
+	    {
+	      bad = what + "host (listed twice)";
+	    }
+	}
+      j->reps.push_back (std::move (r));
+    }
+  if (!bad.empty ())
+    {
+      wipe (pw);
+      return fail_resp (response, "invalid or missing " + bad);
     }
   if (j->master == j->slave)
     {

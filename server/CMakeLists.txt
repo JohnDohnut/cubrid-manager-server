@@ -96,16 +96,47 @@ message(STATUS "CUBRID Manager server version: ${CMS_BUILD_NUMBER}")
 # In-tree: take them straight from the targets this build defines.
 # Standalone: CUBRID_INCLUDE_DIR / CUBRID_LIB_DIR / OPENSSL_* are resolved by
 # build_cmake.sh (or passed by hand) and pointed at a build or install tree.
+include(ExternalProject)
+# HA slave POC: libssh2 (BSD-3) is built from source and linked statically, against an
+# OpenSSL that is also built statically (the same 3.5.7 tarball and hash the engine's
+# 3rdparty uses). Nothing of ssh or OpenSSL is taken from the system.
+set(CMS_LIBSSH2_URL "https://github.com/libssh2/libssh2/releases/download/libssh2-1.11.1/libssh2-1.11.1.tar.gz")
+set(CMS_LIBSSH2_URL_HASH "SHA256=d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7")
+set(CMS_3RDPARTY_DIR ${CMAKE_CURRENT_BINARY_DIR}/3rdparty)
 if(CMS_STANDALONE)
-  foreach(required CUBRID_INCLUDE_DIR CUBRID_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_LIBRARIES)
+  option(CMS_STATIC_OPENSSL "Build OpenSSL from source and link it statically (ignores OPENSSL_*)" ON)
+  set(CMS_REQUIRED CUBRID_INCLUDE_DIR CUBRID_LIB_DIR)
+  if(NOT CMS_STATIC_OPENSSL)
+    list(APPEND CMS_REQUIRED OPENSSL_INCLUDE_DIR OPENSSL_LIBRARIES)
+  endif()
+  foreach(required ${CMS_REQUIRED})
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
       message(FATAL_ERROR
         "${required} is not set. Run build_cmake.sh, or pass -D${required}=... pointing at a CUBRID build or installation.")
     endif()
   endforeach()
   set(CMS_CUBRID_INCLUDES ${CUBRID_INCLUDE_DIR})
-  set(CMS_OPENSSL_INCLUDES ${OPENSSL_INCLUDE_DIR})
-  set(CMS_OPENSSL_LIBS ${OPENSSL_LIBRARIES})
+  if(CMS_STATIC_OPENSSL)
+    ExternalProject_Add(cms_openssl
+      URL                  "https://github.com/CUBRID/3rdparty/raw/develop/openssl/openssl-3.5.7.tar.gz"
+      URL_HASH             "SHA256=a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8"
+      PREFIX               ${CMS_3RDPARTY_DIR}/openssl
+      LOG_CONFIGURE TRUE LOG_BUILD TRUE LOG_INSTALL TRUE
+      TIMEOUT 1800 INACTIVITY_TIMEOUT 60 DOWNLOAD_NO_PROGRESS 1
+      CONFIGURE_COMMAND    <SOURCE_DIR>/config --prefix=${CMS_3RDPARTY_DIR} --libdir=lib no-shared no-module no-tests no-docs
+      BUILD_COMMAND        make -j4 build_sw
+      # a plain make under the parent "make -j" fails with "write jobserver: Bad file descriptor"
+      INSTALL_COMMAND      ${CMAKE_COMMAND} -E env MAKEFLAGS= MFLAGS= make install_sw
+      BUILD_BYPRODUCTS     ${CMS_3RDPARTY_DIR}/lib/libssl.a ${CMS_3RDPARTY_DIR}/lib/libcrypto.a
+      )
+    set(CMS_OPENSSL_TARGET cms_openssl)
+    set(CMS_OPENSSL_ROOT ${CMS_3RDPARTY_DIR})
+    set(CMS_OPENSSL_INCLUDES ${CMS_3RDPARTY_DIR}/include)
+    set(CMS_OPENSSL_LIBS ${CMS_3RDPARTY_DIR}/lib/libssl.a ${CMS_3RDPARTY_DIR}/lib/libcrypto.a)
+  else()
+    set(CMS_OPENSSL_INCLUDES ${OPENSSL_INCLUDE_DIR})
+    set(CMS_OPENSSL_LIBS ${OPENSSL_LIBRARIES})
+  endif()
   find_library(CMS_CUBRIDCS_LIB NAMES cubridcs PATHS ${CUBRID_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
   find_library(CMS_CMDEP_LIB NAMES cmdep PATHS ${CUBRID_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
   find_library(CMS_CMSTAT_LIB NAMES cmstat PATHS ${CUBRID_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
@@ -127,7 +158,34 @@ else()
   set(CMS_CUBRID_LIBS cubridcs cmdep cmstat)
   set(CMS_OPENSSL_INCLUDES ${LIBOPENSSL_INCLUDES})
   set(CMS_OPENSSL_LIBS ${LIBOPENSSL_LIBS})
+  # the engine's static OpenSSL (3rdparty/CMakeLists.txt) - not tried in an engine build yet
+  set(CMS_OPENSSL_TARGET ${LIBOPENSSL_TARGET})
+  set(CMS_OPENSSL_ROOT ${3RDPARTY_LIBS_DIR})
 endif()
+
+ExternalProject_Add(cms_libssh2
+  URL                  ${CMS_LIBSSH2_URL}
+  URL_HASH             ${CMS_LIBSSH2_URL_HASH}
+  PREFIX               ${CMS_3RDPARTY_DIR}/libssh2
+  DEPENDS              ${CMS_OPENSSL_TARGET}
+  LOG_CONFIGURE TRUE LOG_BUILD TRUE LOG_INSTALL TRUE
+  TIMEOUT 600 INACTIVITY_TIMEOUT 60 DOWNLOAD_NO_PROGRESS 1
+  CMAKE_ARGS
+    -DCMAKE_INSTALL_PREFIX=${CMS_3RDPARTY_DIR}/ssh2
+    -DCMAKE_INSTALL_LIBDIR=lib
+    -DCMAKE_BUILD_TYPE=Release
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_STATIC_LIBS=ON
+    -DBUILD_EXAMPLES=OFF
+    -DBUILD_TESTING=OFF
+    -DENABLE_ZLIB_COMPRESSION=OFF
+    -DCRYPTO_BACKEND=OpenSSL
+    -DOPENSSL_ROOT_DIR=${CMS_OPENSSL_ROOT}
+    -DOPENSSL_USE_STATIC_LIBS=ON
+  BUILD_BYPRODUCTS     ${CMS_3RDPARTY_DIR}/ssh2/lib/libssh2.a
+  )
+set(CMS_LIBSSH2_INCLUDES ${CMS_3RDPARTY_DIR}/ssh2/include)
+set(CMS_LIBSSH2_LIBS ${CMS_3RDPARTY_DIR}/ssh2/lib/libssh2.a)
 
 # jsoncpp and libevent stay as the prebuilt archives committed under external/.
 # libevent_openssl only references OpenSSL's stable public API, so it links against
@@ -228,11 +286,15 @@ target_link_libraries(cub_manager PRIVATE
   ${CMS_CUBRID_LIBS} ${CMS_EXTERNAL_LIBS} ${CMS_OPENSSL_LIBS}
   Threads::Threads ${CMAKE_DL_LIBS} rt)
 
-# HA slave POC: ssh to the master through libssh (no system ssh/scp)
-find_library(CMS_LIBSSH_LIB NAMES ssh REQUIRED)
-find_path(CMS_LIBSSH_INCLUDE libssh/libssh.h REQUIRED)
-target_include_directories(cub_manager PRIVATE ${CMS_LIBSSH_INCLUDE})
-target_link_libraries(cub_manager PRIVATE ${CMS_LIBSSH_LIB})
+# HA slave POC: ssh to the master and replicas through the static libssh2 (no system ssh/scp).
+# libssh2.a goes before the OpenSSL archives it calls into.
+target_include_directories(cub_manager BEFORE PRIVATE ${CMS_LIBSSH2_INCLUDES})
+target_link_libraries(cub_manager PRIVATE ${CMS_LIBSSH2_LIBS} ${CMS_OPENSSL_LIBS} ${CMAKE_DL_LIBS})
+add_dependencies(cub_manager cms_libssh2)
+if(CMS_STANDALONE AND CMS_STATIC_OPENSSL)
+  add_dependencies(cm_admin cms_openssl)
+  target_include_directories(cm_admin BEFORE PRIVATE ${CMS_OPENSSL_INCLUDES})
+endif()
 
 # The committed jsoncpp and libevent archives were built without -fPIC, so this has to
 # be a non-PIE executable - which is what the automake build produced as well.
