@@ -13,6 +13,11 @@ POC 전용. 슬레이브가 될 서버의 CMS에 task 5개를 새로 둠. 스크
 - 호스트 키 지문 형식은 OpenSSH와 같음: `SHA256:` + base64(패딩 없음).
 - 리눅스 빌드만. 윈도우 빌드에는 이 task들이 없음.
 
+## 사전 조건(슬레이브)
+
+- `start_ha=yes`이면 슬레이브에 cub_master가 HA가 아닌 상태로 떠 있으면 안 됨. cub_master는 시작할 때만 ha_mode를 읽어서, 그 상태로는 `cubrid heartbeat start`가 실패함. CMS가 service에 묶여 있어 task가 service를 다시 띄울 수는 없으므로, 미리 `cubrid service stop` 후 `cubrid manager start`로 CMS만 띄워 두어야 함. 이 조건은 precheck가 확인함(`precheck_failed`).
+- 슬레이브의 그 DB 서버는 꺼져 있어야 함(`slave_db_running`).
+
 ## 1. `ha_check_ssh` — ssh 연결 확인 (동기, 최대 약 20초)
 
 요청
@@ -97,18 +102,20 @@ POC 전용. 슬레이브가 될 서버의 CMS에 task 5개를 새로 둠. 스크
 | 1 | `precheck` | 슬레이브 | 입력 검사, 로컬 버전·환경, 슬레이브 DB가 꺼져 있는지 | 실패하면 종료(바뀐 것 없음) | 없음 |
 | 2 | `connect` | 마스터 | ssh 접속, 지문 비교, 비밀번호 로그인 | 지문·인증 | 없음 |
 | 3 | `master_check` | 마스터 | 마스터 `$CUBRID`·버전 비교, `cubrid changemode <db>@localhost`가 active, cubrid_ha.conf·databases.txt에 DB 있음, 마스터 노드 목록 읽기 | 위 조건 | 없음 |
-| 4 | `slave_config` | 슬레이브 | 절차 1: cubrid.conf `ha_mode=on`, cubrid_ha.conf(`ha_port_id`, `ha_node_list`=마스터 목록+슬레이브, `ha_db_list`에 DB), databases.txt에 그 DB 줄(볼륨·로그 경로는 마스터 값, 호스트 `마스터:슬레이브`). 항목 단위로 고치고 `.bak.<uuid>` 남김 | 다시 읽어 값 확인 | `.bak`로 복원 |
+| 4 | `slave_config` | 슬레이브 | 절차 1: cubrid.conf `ha_mode=on`, cubrid_ha.conf(`ha_port_id`, `ha_node_list`=마스터 목록+슬레이브, `ha_db_list`에 DB, `ha_copy_sync_mode`는 마스터 값을 노드 수만큼 늘림), databases.txt에 그 DB 줄(볼륨·로그 경로는 마스터 값, 호스트 `마스터:슬레이브`). 항목 단위로 고치고 `.bak.<uuid>` 남김 | 다시 읽어 값 확인 | `.bak`로 복원 |
 | 5 | `master_backup` | 마스터 | `cubrid backupdb -C -D <폴더> --no-check <db>@localhost` | 종료 코드 | 백업 폴더 지움 |
 | 6 | `fetch_backup` | 마스터→슬레이브 | SFTP로 백업 폴더 파일 전부와 `<db>_bkvinf` 받기. 끊기면 받은 자리부터 이어 받음 | 파일마다 크기와 sha256(마스터에서 계산한 값과 비교) | 받은 파일 지움 |
 | 7 | `keep_old_db` | 슬레이브 | 기존 슬레이브 DB 볼륨·로그 폴더와 복제 로그 폴더가 있으면 `<경로>.ha_make_slave_<uuid>`로 옮겨 보관 | 옮겨졌는지 | 제자리로 옮김 |
 | 8 | `restore` | 슬레이브 | `cubrid restoreslave -s master -m <마스터> -B <받은 폴더> <db>` | 종료 코드 | 새로 만든 볼륨·로그 지움 |
 | 9 | `copylog` | 슬레이브 | `cub_admin copylogdb -L <repl_log_home>/<db>_<마스터> -m async --start-page-id=-1 <db>@<마스터>` | 종료 코드 | 복제 로그 폴더 지움 |
-| 10 | `master_config` | 마스터 | 절차 6·8: 마스터 cubrid_ha.conf `ha_node_list`에 슬레이브 추가, databases.txt 그 DB 줄 호스트에 슬레이브 추가. 항목 단위로 고치고 `.bak.<uuid>` 남김. 이어서 `cubrid heartbeat reload` | 다시 읽어 값 확인, 명령 출력 | `.bak`로 복원 후 reload |
-| 11 | `replication_start` | 마스터 | 절차 7: `cubrid heartbeat replication start <슬레이브>` | 명령 출력 | `cubrid heartbeat replication stop <슬레이브>` |
+| 10 | `master_config` | 마스터 | 절차 6·8: 마스터 cubrid_ha.conf `ha_node_list`에 슬레이브 추가(`ha_copy_sync_mode`도 노드 수만큼 늘림. 모자라면 reload가 "Invalid Parameter. ha_copy_sync_mode"로 실패함), databases.txt 그 DB 줄 호스트에 슬레이브 추가. 항목 단위로 고치고 `.bak.<uuid>` 남김. 이어서 `cubrid heartbeat reload` | 다시 읽어 값 확인, 명령 출력 | `.bak`로 복원 후 reload |
+| 11 | `replication_start` | 마스터 | 절차 7: `cubrid heartbeat replication start <슬레이브>`(마스터에 슬레이브용 copylogdb와 applylogdb를 띄움) | 명령 출력 | `cubrid heartbeat replication stop <슬레이브>`(10단계 되돌리기보다 먼저. 노드 목록에서 빠진 뒤에는 stop이 실패하면서도 마지막 줄은 success로 끝나므로 출력에서 `: fail`을 봄) |
 | 12 | `slave_ha_start` | 슬레이브 | 절차 9: `cubrid heartbeat start <db>`(`start_ha=no`면 건너뜀) | 명령 출력 | `cubrid heartbeat stop <db>` |
 | 13 | `verify` | 슬레이브 | 절차 10: `cubrid changemode <db>@localhost`가 standby가 될 때까지 최대 120초(`start_ha=no`면 건너뜀) | standby | 없음 |
 | 14 | `cleanup` | 양쪽 | 마스터·슬레이브의 이번 작업 백업 폴더 지움. 옮겨 보관한 옛 DB는 남김 | 지워졌는지 | 없음 |
 
+- 11단계가 필요한 이유(실측, 11.4.5.1908): `heartbeat reload`는 노드 목록만 다시 읽고 프로세스를 띄우지 않음. 그래서 reload만 하면 정방향 복제는 되지만, failover 뒤 옛 마스터가 다시 붙을 때 그 직후에 새 active에 쓴 데이터가 빠짐. 마스터에서 `copylogdb start`만 한 경우도 마찬가지로 빠짐. applylogdb는 처음 뜰 때 복사된 로그의 현재 끝부터 적용하기 때문임(log_applier.c 2045~2101). replication start로 applylogdb까지 미리 띄워야 빠지지 않음.
+- 되돌리기: 실패하거나 취소되면 바꾼 것이 있는 단계(4~12)만 거꾸로 되돌림. 1~3·13·14처럼 되돌릴 것이 없는 단계는 상태(`done`/`failed`)를 그대로 둠. 취소 뒤에도 되돌리기 명령은 취소되지 않음.
 - 마스터 명령은 ssh 라이브러리의 명령 실행으로 `bash -lc '...'`(로그인 셸, CUBRID 환경 변수 읽기)로 돌림. 비밀번호는 명령에 들어가지 않음.
 - 설정 파일은 SFTP로 읽어 CMS 안에서 그 항목만 고친 뒤 임시 파일로 쓰고 이름을 바꿈.
 - 상태 파일: `$CUBRID/tmp/ha_make_slave/<uuid>/state.json`(단계별 상태, 옮긴 경로, `.bak` 이름. 비밀번호 없음). 진행 기록은 메모리에 최대 1 MB, 넘치면 앞부분을 버리고 `next_offset`은 계속 늘어남.
