@@ -2200,7 +2200,7 @@ namespace
 	    FAIL ("command_failed", "cubrid server start " + db + " (without HA) failed (" + std::to_string (rc) + ")");
 	  }
       }
-    job_log (j, join (j->others_up, ", ") + " run again without HA");
+    job_log (j, "running again without HA: " + join (j->others_up, ", "));
     return true;
   }
 
@@ -3620,13 +3620,13 @@ ext_ha_convert_master (Json::Value &request, Json::Value &response)
     {
       response["message"] = "cub_master restarts in HA mode: the running databases (" +
 			    (j->up_before.empty () ? string ("none") : join (j->up_before, ", ")) +
-			    ") stop until " + join (names, ", ") + " are the active master" +
-			    (j->others_up.empty () ? string ("") : " and " + join (j->others_up, ", ") + " run again without HA");
+			    ") stop. HA: " + join (names, ", ") + " (back once active)" +
+			    (j->others_up.empty () ? string ("") : "; staying single: " + join (j->others_up, ", ") + " (started again without HA)");
       return fail_resp (response, "confirm_master_restart");
     }
   if (!j->others_up.empty () && req_str (request, "confirm_other_db_restart") != "yes")
     {
-      response["message"] = join (j->others_up, ", ") + " also stop and start again without HA (they stay single)";
+      response["message"] = "not converted but running, so they stop and start again without HA: " + join (j->others_up, ", ");
       return fail_resp (response, "confirm_other_db_restart");
     }
   return start_job (j, CONVERT_STEPS, sizeof (CONVERT_STEPS) / sizeof (CONVERT_STEPS[0]), response);
