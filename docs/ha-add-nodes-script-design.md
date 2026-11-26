@@ -1,4 +1,4 @@
-# HA 노드 추가 — 스크립트 + 전용 CMS API 설계 (v2.1)
+# HA 노드 추가 — 스크립트 + 전용 CMS API 설계 (v3)
 
 싱글 DB를 HA로 바꾸고, HA에 슬레이브·레플리카를 여러 대 한 번에 추가하는 기능의 설계임. 동작은 셸 스크립트 하나에 넣고, CMS에는 그 스크립트만 부르는 얇은 전용 API를 둠. runscript는 쓰지 않음.
 
@@ -52,7 +52,7 @@
 | cubrid.conf `ha_mode` | `on` | `replica` |
 | `force_remove_log_archives` | `no`로 씀 | 엔진이 레플리카에서 `yes`로 고정함(쓰지 않음) |
 | 들어갈 목록 | 모든 노드의 `ha_node_list` | 모든 노드의 `ha_replica_list` |
-| 자신의 cubrid_ha.conf | `ha_node_list` = M + S1..SN + X1..Xa, `ha_replica_list` = R1..RM + Y1..Yb | 같음. 자기 이름이 `ha_replica_list`에 있어야 heartbeat가 뜸. 두 목록의 그룹 이름이 같아야 함 |
+| 자신의 cubrid_ha.conf | M의 `ha_node_list`를 순서 그대로 옮기고 끝에 X1..Xa를 붙임. `ha_replica_list`도 M의 것을 그대로 옮기고 끝에 Y1..Yb를 붙임 | 같음. 자기 이름이 `ha_replica_list`에 있어야 heartbeat가 뜸. 두 목록의 그룹 이름이 같아야 함 |
 | `ha_copy_sync_mode` | 값 개수 = `ha_node_list` 노드 수. X가 늘 때마다 마스터·슬레이브 노드에서 값 하나씩 늘림 | 레플리카 노드는 값과 상관없이 항상 async. 레플리카는 `ha_node_list`에 없으므로 다른 노드의 값 개수도 그대로 |
 | 이 노드가 로그를 받는 곳 | `ha_node_list`의 다른 노드 전부 | `ha_node_list`의 노드 전부(다른 레플리카에서는 받지 않음) |
 | 이 노드의 로그를 받는 곳 | 다른 마스터·슬레이브 전부, 레플리카 전부 | 없음 |
@@ -60,6 +60,7 @@
 | 복원 | `restoreslave -s <백업 원본의 상태> -m <M>` | 같음 |
 | 첫 로그 복사 | M에서 `copylogdb --start-page-id=-1` | 같음 |
 
+- 목록 순서: heartbeat의 우선순위는 각 노드 파일에 적힌 `ha_node_list` 순서임. failover를 겪은 HA에서는 지금 마스터가 맨 앞이 아닐 수 있음. 그래서 새 노드는 M의 목록(`ha_node_list`, `ha_replica_list`, `ha_copy_sync_mode`)을 순서 그대로 옮기고 끝에만 붙임. 기존 노드도 끝에만 붙임. S2에서 기존 노드들의 두 목록이 서로 같은지(순서 포함) 확인하고, 다르면 거절함.
 - 근거: 엔진이 copylogdb·applylogdb를 띄우는 대상은 `ha_node_list`의 노드뿐임. 매뉴얼의 "운영 중 레플리카 추가" 절차도 기존 노드는 `ha_replica_list`에 넣고 reload만 하며, 레플리카용 복제 프로세스는 띄우지 말라고 함.
 - reload는 노드 목록만 다시 읽고 프로세스를 띄우지 않음. 그래서 새 슬레이브는 기존 노드마다 `repl start`가 필요함(이전 POC 실측: 이게 없으면 failover 직후 쓴 데이터가 옛 마스터에서 빠짐).
 
@@ -67,7 +68,7 @@
 
 | 기존 노드 | cubrid_ha.conf | databases.txt | reload | repl start |
 |---|---|---|---|---|
-| M, S1..SN | `ha_node_list` += X1..Xa, `ha_copy_sync_mode` 값 a개 늘림, `ha_replica_list` += Y1..Yb | D마다 db-host += X1..Xa | 1회 | X마다(a회) |
+| M, S1..SN | `ha_node_list` 끝에 X1..Xa, `ha_copy_sync_mode` 끝에 값 a개, `ha_replica_list` 끝에 Y1..Yb | D마다 db-host += X1..Xa | 1회 | X마다(a회) |
 | R1..RM | 같음(`ha_copy_sync_mode`는 무시되지만 개수는 맞춰 둠) | 같음 | 1회 | X마다(a회). 레플리카도 슬레이브의 로그를 받음 |
 
 - a = 0(레플리카만 추가)이면 기존 노드는 `ha_replica_list`만 바뀌고 repl start가 없음.
@@ -118,7 +119,7 @@
 
 | 받는 쪽 | 무엇을 | 어떻게 |
 |---|---|---|
-| 헬퍼 | 노드마다 호스트·포트·계정·지문·비밀번호 | fd 3 파이프로 한 줄씩(`호스트<TAB>포트<TAB>계정<TAB>지문<TAB>비밀번호`) 쓴 뒤 닫음 |
+| 헬퍼 | 노드마다 호스트·포트·계정·지문·비밀번호 | fd 3 파이프로 한 줄씩(`호스트<TAB>포트<TAB>계정<TAB>지문<TAB>비밀번호`) 쓴 뒤 닫음. 비밀번호는 넷째 탭 뒤부터 줄 끝까지임(탭이 들어 있어도 됨). 줄바꿈·NUL이 든 비밀번호는 C1에서 거절함 |
 | 스크립트 | 비밀번호를 뺀 나머지 전부 | 명령줄 인자. CMS가 셸 없이 execv로 부르므로 값이 셸에서 해석되지 않음 |
 
 스크립트 인자
@@ -135,7 +136,7 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 ```
 
 - 지문은 스크립트 인자에 넣지 않음. 지문은 헬퍼가 들고 있고 헬퍼가 확인함(스크립트가 다른 지문으로 접속시킬 수 없음).
-- 이름은 영문·숫자·`._-`, 경로는 절대 경로이고 공백·따옴표·`..`가 없어야 함. CMS와 스크립트가 둘 다 검사함. 원격 명령에 넣는 값은 모두 따옴표 처리함.
+- 이름은 영문·숫자로 시작하고 영문·숫자·`._-`만 씀(`-`로 시작하면 명령 옵션으로 읽히므로 거절). 경로는 절대 경로이고 공백·따옴표·`..`가 없어야 함. CMS와 스크립트가 둘 다 검사함. 원격 명령에 넣는 값은 모두 따옴표 처리함.
 - 인자는 `ps`에 보이지만 비밀번호가 없으므로 문제없음. 같은 인자가 작업 폴더 `args`에도 남아 `rollback`·`cleanup`에서 다시 씀.
 
 ## 4. 민감 정보(비밀번호) 전달
@@ -161,7 +162,7 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 | 스크립트 → 헬퍼 | `cm_ssh exec --agent <소켓> <호스트> -- <명령>`, `cm_ssh put --agent <소켓> <호스트> <로컬> <원격>`. 호스트 이름만 넘김 |
 | 헬퍼 → 원격 | ssh 비밀번호 인증(password, keyboard-interactive)에만 씀. 원격 명령 문자열에는 넣지 않음 |
 | 소켓 | 작업 폴더(700) 안의 유닉스 소켓. 접속한 프로세스의 uid가 같은지 확인(SO_PEERCRED) |
-| 끝 | 스크립트가 끝날 때 `cm_ssh quit`. 스크립트가 죽으면 헬퍼는 스크립트 pid가 사라진 것을 보고 스스로 끝남(최대 대기 시간도 둠) |
+| 끝 | CMS가 C4에서 스크립트를 띄운 직후 소켓으로 `bind <스크립트 pid>`를 보냄. 헬퍼는 그 pid가 사라지면 스스로 끝남. 30초 안에 `bind`가 없으면(C4 실패 등) 끝남. 스크립트가 정상으로 끝날 때는 `cm_ssh quit`. C4가 실패하면 CMS가 `quit`을 보냄 |
 | 터미널 실행 | 스크립트가 헬퍼를 `--ask`로 띄움. 헬퍼가 터미널에서 노드마다 `read`처럼 에코 없이 물어봄. 스크립트는 여전히 비밀번호를 모름 |
 
 - 남는 위험: 작업이 도는 동안 같은 계정의 다른 프로세스가 소켓을 통해 헬퍼에 원격 명령을 시킬 수 있음. 같은 계정은 이미 CMS 계정 권한을 다 갖고 있으므로 새로 생기는 위험은 아님. 작업이 끝나면 소켓도 사라짐.
@@ -175,14 +176,16 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 
 | 하위 명령 | 하는 일 |
 |---|---|
-| `agent --socket S --credentials-fd N` / `--ask` | 접속 정보를 받고 소켓에서 요청을 기다림. 준비되면 표준 출력에 `READY` 한 줄 |
+| `agent --socket S --credentials-fd N` / `--ask` | 접속 정보를 받고 소켓에서 요청을 기다림. 준비되면 표준 출력에 `READY` 한 줄을 쓰고 표준 출력을 /dev/null로 돌림(CMS가 읽고 닫은 파이프에 쓰다 죽지 않게) |
+| `bind --agent S <pid>` | 헬퍼가 지켜볼 스크립트 pid를 알려 줌 |
 | `hostkey <호스트> <포트>` | 지문만 읽음(인증 없음). `ha_check_ssh`의 첫 호출 |
 | `check --agent S <호스트>` | 로그인, `uname -n`, CUBRID 경로·버전 |
-| `exec --agent S <호스트> [--daemon] -- <명령>` | 원격 `bash -l -c`로 실행. 표준 입력을 원격으로 넘김. 출력은 그대로, 종료 코드도 그대로. `--daemon`은 출력을 원격 임시 파일로 받은 뒤 읽음 |
+| `exec --agent S <호스트> [--daemon] -- <명령>` | 원격 셸로 실행. 표준 입력을 원격으로 넘김. 출력은 그대로, 종료 코드도 그대로. `--daemon`은 명령을 `</dev/null >원격 임시 파일 2>&1`로 돌린 뒤 그 파일을 읽음(오래 사는 프로세스가 채널을 쥐지 않게) |
 | `put --agent S <호스트> <로컬> <원격>` | SFTP로 올림. 끊기면 올린 자리부터. 끝나면 원격 sha256과 크기 비교 |
 | `quit --agent S` | 헬퍼 종료 |
 
-- 원격 노드에는 아무것도 설치하지 않음. 원격에서 할 일(설정 편집, 상태 읽기)은 스크립트의 "노드 동작" 부분을 `exec ... -- bash -s -- node <동작> <인자>`에 스크립트 자신을 표준 입력으로 보내 실행함. 로컬은 같은 함수를 헬퍼 없이 바로 부름. 그래서 로컬·원격이 같은 코드로 같은 일을 함(케이스 5에서 M이 원격이 되어도 코드가 같음).
+- 원격 노드에는 아무것도 설치하지 않음. 원격에서 할 일(설정 편집, 상태 읽기)은 스크립트의 "노드 동작" 부분으로 함. 실행 방식은 하나로 정함(9.1절): 스크립트 자신을 표준 입력으로 보내 원격 임시 파일(0600, 코드뿐이고 비밀번호 없음)에 다 받은 뒤, 그 파일을 로그인 셸로 표준 입력 없이 실행하고 지움. 표준 입력을 읽는 명령이 스크립트 본문을 먹는 일이 없음. 로컬은 같은 함수를 헬퍼 없이 바로 부름. 그래서 로컬·원격이 같은 코드로 같은 일을 함.
+- 인증: 접속 한 번에 인증은 한 번만 함(서버가 password를 받으면 password, 아니면 keyboard-interactive 중 하나). 한 노드에서 인증이 실패하면 그 노드에는 다시 접속하지 않고 작업을 멈춤. faillock이 켜진 서버에서 고객 계정이 잠기는 것을 막기 위함임.
 - 빌드: CMS CMakeLists에 libssh2 ExternalProject(sha256 고정)를 두고, OpenSSL은 in-tree면 엔진의 `LIBOPENSSL_*`, standalone이면 `OPENSSL_*`를 씀. 링크 옵션 `-Wl,--exclude-libs`로 정적 라이브러리 기호를 내보내지 않음.
 - 설치: `$CUBRID/bin/cm_ssh`, 스크립트는 `$CUBRID/share/cms/ha_add_nodes.sh`(755).
 - 라이선스
@@ -200,11 +203,11 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 | no | id | 주체 | 하는 일 | 앞 조건 | 결과 |
 |---|---|---|---|---|---|
 | C1 | `cms_validate` | CMS | 요청 JSON 형식·이름·경로·역할 검사, 중복 호스트, 새 노드 1대 이상 | — | 틀리면 바로 failure |
-| C2 | `cms_jobdir` | CMS | 잠금 확인(돌고 있는 작업이 있으면 거절), uuid, 작업 폴더(700) | C1 | 작업 폴더 |
-| C3 | `cms_agent` | CMS → H | 헬퍼를 setsid로 띄우고 fd 3에 노드별 정보를 쓰고 닫음. `READY`를 최대 10초 기다림 | C2 | 소켓 준비. 실패하면 작업 폴더 정리 후 failure |
-| C4 | `cms_spawn` | CMS → SC | 스크립트를 setsid로 execv(인자만, 비밀번호 없음), pid 기록 | C3 | 응답 `uuid`, `job_status`=`running` |
+| C2 | `cms_jobdir` | CMS | 잠금 잡기(9.2절: 짧은 flock 안에서 잠금 파일을 확인하고 `starting <uuid> <시각>`을 씀. 살아 있는 작업이 있으면 거절), uuid, 작업 폴더(700) | C1 | 작업 폴더 |
+| C3 | `cms_agent` | CMS → H | 새 실행 함수로 헬퍼를 setsid로 띄움(fd 0~2와 자격 증명 파이프 fd 3만 남기고 4 이상은 모두 닫음. 파이프의 쓰기 쪽은 CLOEXEC). fd 3에 노드별 정보를 쓰고 닫음. `READY`를 최대 10초 기다림. 소켓 이름은 실행마다 새로 정함(`agent.<실행 번호>.sock`) | C2 | 소켓 준비. 실패하면 헬퍼를 끝내고 잠금·작업 폴더 정리 후 failure |
+| C4 | `cms_spawn` | CMS → SC | 스크립트를 setsid로 execv(인자만, 비밀번호 없음, fd 3 이상 모두 닫음), pid 기록, 헬퍼에 `bind <pid>` | C3 | 응답 `uuid`, `job_status`=`running`. 실패하면 헬퍼에 `quit` |
 | C5 | `cms_status` | CMS | `ha_add_nodes_status`: 작업 폴더의 `job`·`steps`·`plan`·`log`를 읽고 pid가 살아 있는지 확인 | C4 | 진행 상태 |
-| C6 | `cms_cancel` | CMS | `ha_add_nodes_cancel`: 스크립트 프로세스 그룹에 SIGTERM(한 번만) | C4 | 스크립트가 되돌리기로 들어감 |
+| C6 | `cms_cancel` | CMS | `ha_add_nodes_cancel`: 스크립트 pid에만 SIGTERM(한 번만. 프로세스 그룹에는 보내지 않음) | C4 | 스크립트가 9.3절 규칙대로 되돌리기로 들어감 |
 
 ### 6.2 스크립트 단계 (`run`)
 
@@ -213,13 +216,13 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 | 묶음 | no | id | 단위 | 주체·대상 | 하는 일(명령) | 앞 조건 | 되돌리기 |
 |---|---|---|---|---|---|---|---|
 | A 확인 | S1 | `precheck` | 1 | SC @L | 인자 검사, L의 상태(싱글/마스터/슬레이브), `ha_db_list`, 두 목록과 기존 노드 입력 대조, 백업 자리(`df`) | C4 | 없음 |
-| | S2 | `node_check [노드]` | 노드(E, X, Y) | SC → H @노드 | 로그인, `uname -n`, CUBRID 경로·버전, 모든 노드 이름이 풀리는지(`getent hosts`). E: D의 상태(M active, S·R standby), 그 노드 설정의 목록. X·Y: D가 꺼져 있는지, 다른 DB 서버·cub_master 상태 | S1, 헬퍼 준비 | 없음 |
+| | S2 | `node_check [노드]` | 노드(E, X, Y) | SC → H @노드 | 로그인, `uname -n`, CUBRID 경로·버전, 모든 노드 이름이 풀리는지(`getent hosts`). E: D의 상태(M active, S·R standby), 그 노드 설정의 두 목록이 M과 같은지(순서 포함), 복제 로그 폴더 자리(`df`). X·Y: D가 꺼져 있는지, 다른 DB 서버·cub_master 상태 | S1, 헬퍼 준비 | 없음 |
 | B 전환(1·2만) | S3 | `convert_stop` | 1 | SC @L | 떠 있는 DB 전부 `cubrid server stop` | S2 | 처음에 떠 있던 DB를 싱글로 기동 |
-| | S4 | `convert_config` | 1 | SC @L | cubrid.conf `ha_mode=on`·`[@db] ha_mode=off`, cubrid_ha.conf(노드 1개), databases.txt. `.bak.<uuid>` | S3 | `.bak` 복원 |
+| | S4 | `convert_config` | 1 | SC @L | cubrid.conf `ha_mode=on`·`[@db] ha_mode=off`, cubrid_ha.conf(노드 1개), databases.txt. `.bak.<uuid>.<단계 번호>` | S3 | `.bak` 복원 |
 | | S5 | `convert_restart` | 1 | SC @L | `cub_commdb -A` → `cubrid heartbeat start` | S4 | heartbeat 멈춤, cub_master 내림 |
 | | S6 | `convert_verify` | 1 | SC @L | D 모두 active(최대 180초) | S5 | 없음 |
 | | S7 | `convert_start_others` | 1 | SC @L | 고르지 않았던 DB를 싱글로 다시 기동 | S6 | 그 DB 멈춤 |
-| C 준비 | S8 | `new_config [X/Y]` | 노드(X, Y) | SC → H @X/Y | cubrid.conf `ha_mode`, cubrid_ha.conf(최종 목록 + M의 [common] 나머지), databases.txt(D 줄). `.bak.<uuid>` | S2(전환이면 S7) | `.bak` 복원, 없던 파일은 지움 |
+| C 준비 | S8 | `new_config [X/Y]` | 노드(X, Y) | SC → H @X/Y | cubrid.conf `ha_mode`, cubrid_ha.conf(최종 목록 + M의 [common] 나머지), databases.txt(D 줄). `.bak.<uuid>.<단계 번호>` | S2(전환이면 S7) | `.bak` 복원, 없던 파일은 지움 |
 | | S9 | `backup [D]` | DB | SC @백업 원본 | `cubrid backupdb -C --no-check <D>@localhost`(DB마다 한 번만) | S8 전부 | 백업 폴더 지움 |
 | | S10 | `send_backup [X/Y, D]` | DB×노드 | SC → H(SFTP) | 백업 파일 + bkvinf 올림, sha256 확인 | S9(그 D) | 받은 폴더 지움 |
 | | S11 | `keep_old_db [X/Y, D]` | DB×노드 | SC → H @X/Y | 기존 볼륨·로그·복제 로그 폴더를 `.ha_add_nodes_<uuid>`로 옮겨 보관 | S10 | 제자리로 |
@@ -227,9 +230,9 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 | | S13 | `first_copylog [X/Y, D]` | DB×노드 | SC → H @X/Y | `cub_admin copylogdb -L <로그 폴더>/<D>_<M> -m async --start-page-id=-1 <D>@<M>` | S12 | 복제 로그 폴더 지움 |
 | D 시작 | S14 | `new_ha_start [X]` | 노드(X1..Xa) | SC → H @X | HA 아닌 cub_master면 `cub_commdb -A` → `cubrid heartbeat start`(데몬 출력 처리) | 그 노드의 S13 전부 | `heartbeat stop`, cub_master를 작업 전 상태로 |
 | | S15 | `new_ha_start [Y]` | 노드(Y1..Yb) | SC → H @Y | 같음 | S14 전부 | 같음 |
-| | S16 | `peer_repl_start [X]` | 노드(a ≥ 2일 때 X마다) | SC → H @X | 다른 Xj의 Copylogdb가 없으면 `heartbeat repl start <Xj>` | S15 | `repl stop <Xj>`(띄운 것만) |
-| E 등록 | S17 | `existing_config [E]` | 노드(M → S1..SN → R1..RM) | SC(@L) 또는 SC → H | 2.2 표대로 cubrid_ha.conf·databases.txt, `.bak.<uuid>`, `cubrid heartbeat reload` | S16 | `.bak` 복원 + reload |
-| | S18 | `existing_repl_start [E]` | 노드(a ≥ 1일 때, 같은 순서) | SC(@L) 또는 SC → H | X마다 `cubrid heartbeat repl start <X>` | S17 전부 | X마다 `repl stop <X>`(그 노드의 S17 되돌리기보다 먼저), 새로 생긴 로그 폴더 지움 |
+| | S16 | `peer_repl_start [X]` | 노드(a ≥ 2일 때 X마다) | SC → H @X | 다른 Xj의 Copylogdb가 없으면 `heartbeat repl start <Xj>`(원격 `--daemon`) | S15 | `repl stop <Xj>`(띄운 것만) |
+| E 등록 | S17 | `existing_config [E]` | 노드(M → S1..SN → R1..RM) | SC(@L) 또는 SC → H | 2.2 표대로 cubrid_ha.conf·databases.txt, `.bak.<uuid>.<단계 번호>`, `cubrid heartbeat reload`. reload 뒤 `cubrid heartbeat list`(또는 status)에 새 노드가 보이는지 확인(reload 실패를 종료 코드만으로 판단하지 않음) | S16 | `.bak` 복원 + reload |
+| | S18 | `existing_repl_start [E]` | 노드(a ≥ 1일 때, 같은 순서) | SC(@L) 또는 SC → H | X마다 `cubrid heartbeat repl start <X>`(원격은 `--daemon`, L은 9.1절의 로컬 데몬 방식) | S17 전부 | X마다 `repl stop <X>`(그 노드의 S17 되돌리기보다 먼저), 새로 생긴 로그 폴더 지움 |
 | F 확인 | S19 | `verify [X/Y]` | 노드(X, Y) | SC → H | D 모두 standby. X·Y에 `ha_node_list` 다른 노드 전부의 Copylogdb. E에 X마다 Copylogdb(최대 120초) | S18 | 없음 |
 | | S20 | `cleanup` | 1 | SC, H | L과 X·Y의 이번 작업 백업 폴더 지움(옮겨 보관한 옛 DB는 남김), `cm_ssh quit` | S19 | 없음 |
 
@@ -259,6 +262,10 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 | P7 | CMS 재시작 | 작업 계속 | 스크립트·헬퍼가 setsid라 영향 없음. 새 CMS는 작업 폴더로 상태를 읽음 | 없음 |
 | P8 | 작업이 도는 동안 | 같은 노드의 다른 CMS 작업(DB 시작·중지, HA 시작·중지, 백업 등) | 잠금 파일을 CMS의 HA·DB 변경 task들이 확인하고 거절하는 것을 권장함(이번 POC 범위 밖, 화면에서 막음) | — |
 | P9 | `rollback`·`cleanup` | 비밀번호 | 비밀번호는 작업 폴더에 없으므로 C3을 다시 함(화면이 다시 입력받음) | — |
+| P10 | C2 잠금 | 같은 때 들어온 다른 요청 | C2가 flock 안에서 잠금 파일을 확인·기록함(9.2). 둘 중 하나만 통과함 | 없음 |
+| P11 | 작업 중 L에서 띄운 DB 서버·복제 프로세스 | 다음 작업의 C2 | 잠금을 fd로 오래 잡지 않으므로(9.2) 물려받을 것이 없음. 로컬 데몬은 setsid·표준 입출력 리다이렉트로 띄움(9.1) | 없음 |
+| P12 | CMS 자동 작업(예약 백업, 자동 볼륨 추가) | S3(DB 멈춤)·S9(백업)와 겹침 | 막지 못함. `plan`이 D에 걸린 자동 작업을 찾아 경고하고, 겹치지 않는 시간에 돌리라고 알림(미확인: 겹칠 때의 실제 영향) | — |
+| P13 | 원래 작업의 헬퍼 | `rollback`·`cleanup`의 새 헬퍼 | 소켓 이름을 실행마다 새로 정함. 옛 헬퍼가 살아 있으면 CMS가 먼저 `quit`을 보냄 | 없음 |
 
 - 검토했으나 쓰지 않은 구조: CMS가 스크립트를 단계별로 나눠 차례로 부르는 방식(각 단계가 끝나면 CMS가 다음 단계를 부름). 중간에 기다림이 없어지는 대신 CMS가 흐름을 쥐게 됨. 그러면 CMS가 재시작될 때 작업이 멈추고, 되돌리기 순서도 CMS가 알아야 함. 그래서 스크립트 한 번 실행으로 끝까지 가고 CMS는 읽기만 하는 구조를 고름.
 
@@ -285,6 +292,7 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
   - DB 서버의 HA 예약 연결 수는 서버가 뜰 때 정해짐. 노드를 늘린 뒤 추가된 복제 연결은 일반 연결 자리(`max_clients`)를 씀. `plan`이 M의 `max_clients` 여유를 확인해 모자라면 알림.
   - 전송량은 DB 전체 백업 크기 × (a + b)임. 보관 로그가 첫 백업부터 마지막 새 노드의 HA 시작까지 남아 있어야 하므로, a + b가 크면 보관 로그 보존 설정을 미리 늘려야 함(`plan`이 전송량을 알려 줌).
   - 엔진 헤더에 heartbeat 노드 수 상수(8)가 있으나 11.4 소스에서 쓰는 곳을 찾지 못함. 큰 구성(노드 9대 이상)은 실측 항목으로 둠.
+- 케이스 5·6은 실측 전까지 막아 둠(`plan`이 `unsupported_case`로 거절). `-s slave`·`-s replica`면 엔진이 원본의 복제 적용 위치(db_ha_apply_info)를 그대로 두는데, 첫 로그 복사가 그 위치부터 지금까지의 틈을 메우는지 확인되지 않았기 때문임(슬레이브·레플리카는 반영이 늦어 틈이 더 큼).
 - 케이스 5(미검증, 선택)
   - Sj의 standby DB를 온라인 백업해 `restoreslave -s slave -m <M>`로 복원하고, 첫 로그 복사는 M에서 받음.
   - 매뉴얼의 슬레이브 원본 절차는 restoredb와 보관 로그 복사를 씀. 이 방식으로 대신할 수 있는지는 실측해야 함.
@@ -302,11 +310,51 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 - 1:N:M에서의 순서
   - 기록이 실행 순서대로 쌓이므로 거꾸로 실행하면 R1..RM, S1..SN, M 순서로 되돌아가고, 같은 노드 안에서는 `repl stop <X>`가 설정 복원보다 먼저 옴. 노드가 목록에서 빠진 뒤의 `repl stop`은 실패하면서도 마지막 줄을 success로 찍으므로(이전 POC 실측), 결과는 출력의 실패 문구로 판단함.
   - 새 노드는 Y1..Yb, X1..Xa 순서로 heartbeat를 멈춘 뒤 D마다 S13~S10을 거꾸로 되돌림.
-  - 일부 기존 노드만 X를 알고 있는 동안에도 heartbeat는 모르는 노드의 신호를 무시하므로 서비스에는 영향이 없음.
+  - 일부 기존 노드만 X를 알고 있는 동안에도 서비스에는 영향이 없음. heartbeat는 모르는 노드가 보낸 상태는 버리지만 heartbeat 요청에는 응답함. 그래서 X는 M이 마스터인 것을 알게 되고 혼자 마스터가 되지 않음.
 - 전환(케이스 1·2) 뒤 단계에서 실패하면 기본으로 전환 직후 상태(노드 1개 HA 마스터)까지만 되돌림. 전환까지 되돌리면 DB가 한 번 더 재시작되기 때문임. `--rollback-convert`면 싱글까지 되돌림.
-- 취소: CMS가 스크립트의 프로세스 그룹에 SIGTERM을 보냄. 스크립트는 표시를 남기고, 지금 돌던 명령이 끝나면 되돌리기로 들어감. 되돌리기 중에는 TERM을 무시함(되돌리기 명령은 취소되지 않음).
+- 취소는 9.3절.
 - CMS 재시작: 영향 없음(7절 P7). 스크립트가 죽어 있는데 상태가 running이면 `interrupted`로 보이고, `rollback`으로 되돌릴 수 있음.
-- 한 번에 한 작업: 스크립트가 `$CUBRID/tmp/ha_add_nodes/lock`을 flock으로 잡음. CMS도 C2에서 확인함.
+- 한 번에 한 작업은 9.2절.
+
+### 9.1 명령 실행 규칙
+
+- 오류 처리: `set -e`에 기대지 않음. 명령마다 종료 코드와 출력의 실패 문구를 직접 봄(`repl stop`처럼 실패해도 success를 찍는 명령이 있음). `set -x`는 쓰지 않음.
+- 표준 입력: 노드 동작 안의 외부 명령은 모두 `</dev/null`로 돌림(DBA 비밀번호 프롬프트 같은 것이 멈춰 기다리거나 입력을 먹지 않게).
+- 원격 노드 동작: `cm_ssh exec --agent S <노드> -- 'f=$(mktemp) && cat >"$f" && bash -l "$f" node <동작> <인자> </dev/null; rc=$?; rm -f "$f"; exit $rc'`에 스크립트 자신을 표준 입력으로 보냄. 로그인 셸 초기화 파일이 찍는 글이 결과에 섞이므로, 노드 동작은 결과를 `@@BEGIN <실행 번호>`와 `@@END <종료 코드>` 사이에만 찍고 스크립트는 그 사이만 읽음.
+- 오래 사는 프로세스를 남기는 명령(`cubrid server start`, `cubrid heartbeat start`, `cubrid heartbeat repl start`, cub_master)
+  - 원격: `cm_ssh exec --daemon`.
+  - 로컬(L): `setsid <명령> </dev/null >작업 폴더의 임시 파일 2>&1`로 띄우고 끝나기를 기다린 뒤 그 파일을 읽음. 스크립트는 오래 열어 두는 fd(잠금 등)가 없으므로(9.2) 물려줄 것이 없음.
+
+### 9.2 한 번에 한 작업(잠금)
+
+- 잠금 파일 `$CUBRID/tmp/ha_add_nodes/lock`의 내용으로 판단하고, 파일을 고칠 때만 짧게 flock을 잡았다가 바로 놓음. 작업 내내 잡고 있는 fd가 없으므로, 작업 중 띄운 DB 서버·복제 프로세스가 잠금을 물려받는 일이 없음.
+- 내용: `starting <uuid> <시각>`(C2가 씀) → `running <uuid> <스크립트 pid> <pid 시작 시각>`(스크립트가 시작할 때 씀) → 끝나면 비움.
+- 판단: `running`이면 그 pid가 살아 있고 시작 시각이 같을 때만 사용 중임. `starting`이면 60초가 지나면 버려진 것으로 봄. 같은 때 들어온 두 요청은 flock 안에서 차례로 보므로 하나만 통과함.
+- `rollback`·`cleanup`은 원래 작업의 스크립트·헬퍼가 살아 있으면 거절함(옛 헬퍼가 남아 있으면 CMS가 먼저 `quit`을 보냄).
+
+### 9.3 취소
+
+- CMS는 스크립트 pid에만 SIGTERM을 보냄. 스크립트는 trap에서 표시만 함.
+- 단계마다 취소가 언제 먹는지를 정해 둠.
+
+| 단계 | 취소 시점 | 이유 |
+|---|---|---|
+| S9 `backup`(로컬) | 바로: 스크립트가 backupdb를 끝냄 | 되돌리기가 백업 폴더를 통째로 지우므로 반쯤 만든 백업이 남지 않음 |
+| S10 `send_backup` | 바로: 헬퍼에 전송 중단을 요청 | 되돌리기가 받은 폴더를 지움 |
+| S12 `restore`, S13 `first_copylog`(원격) | 원격 명령이 끝난 뒤 | 도는 중에 되돌리기(볼륨 지움)와 겹치지 않게. 기다리는 동안 상태에 "취소 대기" 표시 |
+| S3~S7 전환, S14·S15 HA 시작, S17·S18 등록 | 그 단계의 명령이 끝난 뒤 | 반쯤 바뀐 HA 상태를 남기지 않게 |
+| 그 밖 | 다음 단계로 넘어가기 전 | |
+
+- 되돌리기 중에는 TERM을 무시함(되돌리기 명령은 취소되지 않음).
+- 기다리는 명령은 백그라운드로 띄우고 `wait`함. 그래야 trap이 바로 돌아 "취소 대기" 상태를 남길 수 있음.
+
+### 9.4 되돌리기 기록(`undo`)
+
+- 한 줄에 하나: `<번호> <단계 번호> <노드> <종류> <인자…>`. 종류는 `restore_file <경로> <백업 경로>`, `remove_created <목록 파일>`, `move_back <원래 경로> <옮긴 경로>`, `heartbeat_stop`, `repl_stop <노드>`, `reload`, `server_start <DB>` 등.
+- 백업 파일 이름은 `<파일>.bak.<uuid>.<단계 번호>`임. 한 작업에서 같은 파일을 두 번 고쳐도(케이스 1·2에서 L의 cubrid_ha.conf·databases.txt는 S4와 S17에서 바뀜) 백업이 겹치지 않음. 그래서 거꾸로 되돌리면 싱글 시절 파일까지 돌아감.
+- 지우는 되돌리기는 경로째 지우지 않음. 그 단계가 만든 파일·폴더를 목록 파일(작업 폴더)에 적어 두고 그것만 지움. 예: S11이 반만 옮긴 상태에서 S12 되돌리기가 남은 옛 파일까지 지우는 일이 없음.
+- 되돌린 줄은 `done <번호>`를 덧붙여 적음. `rollback`을 다시 돌리면 끝난 줄은 건너뜀.
+- 접속이 안 되는 노드의 줄은 건너뛰고 계속 감. 끝에 "되돌리지 못한 항목"(노드, 종류, 경로)으로 상태에 남김.
 
 ## 10. CMS API
 
@@ -352,6 +400,7 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 - 기존 노드 입력은 M 설정의 두 목록과 같아야 함(2.2).
 - 새 노드: D가 떠 있으면 안 됨. 다른 DB 서버가 떠 있으면 cub_master를 내려야 해서 거절함.
 - 백업 자리: 백업 원본에 D 전체 백업 크기, 새 노드마다 받는 폴더에 같은 크기가 있어야 함(`plan`이 `df`로 확인).
+- 복제 로그 자리: 새 슬레이브마다 모든 기존 노드(레플리카 포함)와 다른 새 노드에 그 슬레이브의 복제 로그 폴더가 생김. `plan`이 각 노드의 복제 로그 상위 폴더 여유를 D마다 로그 볼륨 크기 × (`ha_copy_log_max_archives` + 1)로 어림해 확인함.
 - 방화벽(`ha_port_id` UDP, `cubrid_port_id` TCP)은 확인하지 못함. 안 열려 있으면 S19에서 실패함.
 
 ## 12. 확인할 것(N노드 시험 환경에서 실측)
@@ -369,6 +418,12 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 | 취소·실패 되돌리기 뒤 모든 노드가 시작 전과 같은지(설정 파일, DB 폴더, HA 프로세스, cub_master) — 실패 지점을 S2·S10·S14·S17(k번째 노드)·S18로 바꿔 가며 | 9절 |
 | CMS 재시작 중에도 작업이 끝까지 가는지, 상태 조회가 맞는지 | 7절 P7 |
 | 비밀번호가 `ps`, `/proc/*/cmdline`·`environ`, 작업 폴더, 로그, 원격 노드 어디에도 없는지, 헬퍼 메모리를 같은 계정이 못 읽는지 | 4절 |
+| L에서 S5·S7·S18 뒤 띄워진 cub_server·copylogdb·applylogdb가 작업 폴더나 잠금 파일의 fd를 쥐고 있지 않은지(`/proc/<pid>/fd`), 작업이 끝난 뒤 다음 작업이 잠금을 얻는지 | 9.1·9.2 |
+| S12 도중 취소: X의 restoreslave가 끝난 뒤에 되돌리기가 시작되는지 | 9.3 |
+| DBA 비밀번호가 걸린 DB에서 원격 노드 동작이 끝까지 실행되는지(입력을 기다리며 멈추지 않는지) | 9.1 |
+| 기존 노드의 복제 로그 폴더 자리 어림이 맞는지 | 11절 |
+| `cubrid heartbeat reload`가 실패할 때 종료 코드·출력이 실패를 알려 주는지 | S17 확인 방법 |
+| 틀린 비밀번호로 한 번 실패했을 때 접속 시도가 한 번에서 끝나는지(faillock 계정 잠김 방지) | 5절 |
 
 ## 13. 한계
 
