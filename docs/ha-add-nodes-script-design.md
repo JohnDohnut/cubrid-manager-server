@@ -108,9 +108,26 @@
     {"host": "nodeR1", "ssh_port": 22, "os_user": "cubrid", "hostkey_sha256": "SHA256:...", "os_password": "..."}
   ],
   "repl_log_home": "", "backup_path": "", "remote_backup_path": "",
+  "ha_group": "cubrid", "ha_port_id": 59901,     // 승격할 때만
   "rollback_convert": "no", "start_ha": "yes"
 }
 ```
+
+선택 값과 기본값(구현 기준)
+
+| 키 | 스크립트 인자 | 기본값 | 뜻 |
+|---|---|---|---|
+| `master_host` | `--master-host` | L의 `uname -n` | L의 HA 노드 이름. 다른 값이면 거절함 |
+| `db_names` | `--db` | 없음(싱글일 때 필수) | 승격할 때 HA로 넣을 DB. HA면 주지 않음(대상은 `ha_db_list`) |
+| `repl_log_home` | `--repl-log-home` | 새 노드마다 그 노드의 `$CUBRID_DATABASES` | 새 노드의 복제 로그 상위 폴더. 기본값과 다르면 새 노드의 `ha_copy_log_base`로 씀 |
+| `backup_path` | `--backup-path` | L의 `$CUBRID_DATABASES/ha_add_nodes_backup` | L에서 백업을 둘 폴더. 그 아래 `<작업 번호>/<DB>`를 만들고 끝나면 지움 |
+| `remote_backup_path` | `--remote-backup-path` | 새 노드마다 그 노드의 `$CUBRID_DATABASES/ha_add_nodes_backup` | 새 노드에서 받은 백업을 둘 폴더. 위와 같음 |
+| `ha_group` | `--ha-group` | `cubrid` | 승격할 때만: 새 `ha_node_list`의 그룹 이름. HA면 쓰지 않음(M의 값) |
+| `ha_port_id` | `--ha-port-id` | `59901` | 승격할 때만: `ha_port_id`. HA면 쓰지 않음(M의 값을 새 노드에 옮김) |
+| `start_ha` | `--no-start-ha`(no일 때) | `yes` | `no`면 새 노드 HA 시작·확인을 하지 않음 |
+| `rollback_convert` | `--rollback-convert`(yes일 때) | `no` | 승격 뒤 단계에서 실패하면 싱글까지 되돌릴지 |
+
+- `ha_group`·`ha_port_id`는 요청 키로 받음(화면에서 숨겨도 기본값이 쓰임). HA에서 시작하는 케이스는 M의 cubrid_ha.conf 값을 그대로 씀.
 
 - 노드 원소의 키는 `host`, `ssh_port`, `os_user`, `os_password`, `hostkey_sha256`이고, `new_nodes` 원소에만 `role`(`slave`/`replica`)이 더 있음. 본문의 "포트·계정·지문"은 이 키들을 줄여 부른 것임.
 - `existing_nodes` = L 설정의 `ha_node_list`에서 L(과 새 노드)을 뺀 노드 + `ha_replica_list`에서 L을 뺀 노드. 케이스 3·4는 M이 L이라 빠지고, 케이스 5·6은 M이 들어감(M이 원격이므로).
@@ -133,6 +150,7 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
   --new <slave|replica>:<호스트>:<포트>:<계정>     # 새 노드, 여러 번
   [--existing <호스트>:<포트>:<계정>]...           # 기존 노드, 여러 번
   [--repl-log-home <경로>] [--backup-path <경로>] [--remote-backup-path <경로>]
+  [--ha-group <이름>] [--ha-port-id <포트>]          # 승격할 때만
   [--rollback-convert] [--no-start-ha]
 ```
 
