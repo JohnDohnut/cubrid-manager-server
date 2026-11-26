@@ -63,7 +63,9 @@
 
 #include <thread>
 
+#include <grp.h>
 #include <netdb.h>
+#include <pwd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -320,16 +322,93 @@ namespace
     return "SHA256:" + out;
   }
 
+  int run_cmd (const vector<string> &argv, const vector<string> *env, const string *in, string *out, string *err,
+	       double limit_sec);
+  string find_program (const char *name);
+
   /*
-   * A file the manager runs, and every folder above it up to /, has to belong to this account or to root and
-   * must not be writable by the group or by others: whoever can write one of them can change what runs.
+   * The users of a group besides `owner`: the members the group database lists, and the accounts whose primary
+   * group it is. "" when the group is the owner's alone: what such a group may write, only the owner can write.
    */
-  bool safe_owner_mode (const struct stat &st)
+  string other_users_of_group (gid_t gid, uid_t owner)
   {
-    return (st.st_mode & (S_IWGRP | S_IWOTH)) == 0 && (st.st_uid == getuid () || st.st_uid == 0);
+    string owner_name, others;
+    struct passwd pw, *pwp = NULL;
+    vector<char> buf (65536);
+    if (getpwuid_r (owner, &pw, buf.data (), buf.size (), &pwp) == 0 && pwp != NULL)
+      {
+	owner_name = pw.pw_name;
+      }
+    struct group gr, *grp = NULL;
+    int rc = getgrgid_r (gid, &gr, buf.data (), buf.size (), &grp);
+    if (rc != 0)
+      {
+	return "(the group cannot be read)";
+      }
+    for (char **m = grp != NULL ? gr.gr_mem : NULL; m != NULL && *m != NULL; m++)
+      {
+	if (owner_name != *m)
+	  {
+	    others += string (*m) + " ";
+	  }
+      }
+    string all, getent = find_program ("getent");
+    if (getent.empty () || run_cmd ({ getent, "passwd" }, NULL, NULL, &all, NULL, 10) != 0)
+      {
+	all.clear ();
+	read_file ("/etc/passwd", &all);
+      }
+    for (const string &line : split (all, '\n'))
+      {
+	vector<string> f = split (line, ':');
+	if (f.size () >= 4 && f[3] == std::to_string ((unsigned long) gid) && f[2] != std::to_string ((unsigned long) owner)
+	    && (" " + others).find (" " + f[0] + " ") == string::npos)
+	  {
+	    others += f[0] + " ";
+	  }
+      }
+    return trim (others);
   }
 
-  bool safe_parents (const string &path, string *why)
+  /*
+   * A file the manager runs, and every folder above it up to /, has to be safe from other accounts: whoever can
+   * write one of them can change what runs. It has to belong to this account or to root; nobody else may write
+   * it; its group may write it only when that group is the primary group of the scripts' owner and has no other
+   * user (then the group's write is the owner's own). "" when safe, else why, with what to do about it.
+   */
+  string unsafe_reason (const string &path, const struct stat &st, uid_t script_owner)
+  {
+    char mode[16];
+    snprintf (mode, sizeof (mode), "%o", (unsigned) (st.st_mode & 07777));
+    if (st.st_uid != getuid () && st.st_uid != 0)
+      {
+	return path + " is owned by another account (uid " + std::to_string ((unsigned long) st.st_uid)
+	       + "); it has to belong to this account or to root";
+      }
+    if ((st.st_mode & S_IWOTH) != 0)
+      {
+	return path + " is writable by everyone (mode " + mode + "); run: chmod o-w " + path;
+      }
+    if ((st.st_mode & S_IWGRP) != 0)
+      {
+	struct passwd pw, *pwp = NULL;
+	vector<char> buf (16384);
+	if (getpwuid_r (script_owner, &pw, buf.data (), buf.size (), &pwp) != 0 || pwp == NULL || pw.pw_gid != st.st_gid)
+	  {
+	    return path + " is writable by its group (mode " + mode + ", gid " + std::to_string ((unsigned long) st.st_gid)
+		   + "), which is not the primary group of the scripts' owner; run: chmod g-w " + path;
+	  }
+	string others = other_users_of_group (st.st_gid, script_owner);
+	if (!others.empty ())
+	  {
+	    return path + " is writable by its group (mode " + mode + "), and the group has other users (" + others
+		   + "); run: chmod g-w " + path;
+	  }
+      }
+    return "";
+  }
+
+  bool safe_parents (const string &path, uid_t script_owner, string *why)
   {
     string cur = path;
     for (;;)
@@ -341,9 +420,14 @@ namespace
 	  }
 	cur = p == 0 ? "/" : cur.substr (0, p);
 	struct stat st;
-	if (stat (cur.c_str (), &st) != 0 || !S_ISDIR (st.st_mode) || !safe_owner_mode (st))
+	if (stat (cur.c_str (), &st) != 0 || !S_ISDIR (st.st_mode))
 	  {
-	    *why = cur + " is writable by others or owned by another account";
+	    *why = cur + " is not a folder";
+	    return false;
+	  }
+	*why = unsafe_reason (cur, st, script_owner);
+	if (!why->empty ())
+	  {
 	    return false;
 	  }
 	if (cur == "/")
@@ -369,12 +453,7 @@ namespace
 	code = "script_tampered";
 	*why = path + " is missing";
       }
-    else if (!safe_owner_mode (st))
-      {
-	code = "script_unsafe";
-	*why = path + " is writable by others or owned by another account";
-      }
-    else if (!safe_parents (path, why))
+    else if (! (*why = unsafe_reason (path, st, st.st_uid)).empty () || !safe_parents (path, st.st_uid, why))
       {
 	code = "script_unsafe";
       }
@@ -1124,17 +1203,17 @@ namespace
       { "port_timeout", "Check the firewall and the network path to the node." },
       { "hostkey_mismatch", "Find out why the node's host key changed, then confirm the fingerprint again." },
       { "no_password_auth", "Allow PasswordAuthentication or KbdInteractiveAuthentication in the node's sshd." },
-      { "auth_failed", "Check the account and the password. If the account is locked, ask its administrator to unlock it." },
+      { "auth_failed", "Check the account and the password. A locked account (faillock) and sshd's AllowUsers refuse a login the same way." },
       { "remote_shell_failed", "Check the account's login shell on the node." },
       { "cubrid_not_found", "Enter the account that CUBRID is installed for." },
       { "node_script_missing", "Check the node's CUBRID package: it has to include the manager server." },
       { "node_script_version_mismatch", "Install the same CUBRID package on the node." },
       { "node_script_tampered", "Put the package's file back on the node and find out how it changed." },
-      { "node_script_unsafe", "Restore the owner and the permissions of the installed files on the node." },
+      { "node_script_unsafe", "Fix the owner or the permission on the node as the message says." },
       { "version_mismatch", "Bring every node to the same CUBRID version." },
       { "controlpath_too_long", "Install CUBRID under a shorter path." },
       { "script_tampered", "Put the package's file back on this server and find out how it changed." },
-      { "script_unsafe", "Restore the owner and the permissions of the installed files on this server." },
+      { "script_unsafe", "Fix the owner or the permission on this server as the message says." },
       { "login_timeout", "Find out why logins to the node are slow (sshd UseDNS, PAM), then try again." },
       { "ssh_failed", "See the message and the node's sshd log." },
     };
@@ -1200,6 +1279,7 @@ namespace
   string common_ssh_config ()
   {
     return "Host *\n"
+	   "  IgnoreUnknown ChallengeResponseAuthentication\n"
 	   "  ControlMaster no\n"
 	   "  BatchMode yes\n"
 	   "  PubkeyAuthentication no\n"
@@ -1592,7 +1672,7 @@ namespace
       }
     else
       {
-	argv.insert (argv.end (), { "-o", "KbdInteractiveAuthentication=yes", "-o", "ChallengeResponseAuthentication=yes" });
+	argv.insert (argv.end (), { "-o", "KbdInteractiveAuthentication=yes" });
       }
     vector<string> opts = node_opts (cfg, *r, true);
     argv.insert (argv.end (), opts.begin (), opts.end ());
@@ -1704,7 +1784,7 @@ namespace
 	      }
 	  }
       }
-    else if (log.find ("Permission denied") != string::npos)
+    else if (log.find ("Permission denied") != string::npos || log.find ("Too many authentication failures") != string::npos)
       {
 	if (state == WAIT_ASK)
 	  {
@@ -1712,7 +1792,9 @@ namespace
 	  }
 	else
 	  {
-	    set_error (r, "auth_failed", "the login of " + r->user + " failed (wrong password, or the account is locked)");
+	    /* ssh says the same for all of these; only the node's sshd log tells them apart */
+	    set_error (r, "auth_failed", "the node refused the login of " + r->user
+		       + " (wrong password, locked account, or an account sshd does not let in)");
 	  }
       }
     else
@@ -2089,9 +2171,14 @@ if [ -n "$c" ] && [ -f "$f" ]; then
   echo "NODE_SCRIPT_SHA256=$(sha256sum "$f" | cut -d' ' -f1)"
   echo "NODE_SCRIPT_VERSION=$(sed -n 's/^SCRIPT_VERSION=//p' "$f" | head -1)"
   echo "NODE_UID=$(id -u)"
+  o=$(stat -c %u "$f")
+  on=$(getent passwd "$o" | cut -d: -f1)
+  g=$(getent passwd "$o" | cut -d: -f4)
+  echo "OWNER_GID=$g"
+  echo "GROUP_OTHERS=$( { getent group "$g" | cut -d: -f4 | tr ',' '\n' | grep -vx "$on"; getent passwd | awk -F: -v g="$g" -v o="$o" '$4 == g && $3 != o { print $1 }'; } | sed '/^$/d' | sort -u | tr '\n' ' ')"
   p=$f
   while :; do
-    echo "PERM=$(stat -c '%u %a' "$p") $p"
+    echo "PERM=$(stat -c '%u %g %a' "$p") $p"
     [ "$p" = / ] && break
     p=$(dirname "$p")
   done
@@ -2122,15 +2209,35 @@ echo "CHECK_DONE=yes"
 	  }
 	if (l.compare (0, 5, "PERM=") == 0 && bad_perm.empty ())
 	  {
-	    /* PERM=<uid> <octal mode> <path>: the node's account or root, no write bit for group or others */
+	    /*
+	     * PERM=<uid> <gid> <octal mode> <path>: the same rule as for this server's scripts (unsafe_reason):
+	     * the node's account or root, no write for others, group write only for the primary group of the
+	     * script's owner when that group has no other user (OWNER_GID, GROUP_OTHERS)
+	     */
 	    std::istringstream ps (l.substr (5));
-	    string uid, mode, path;
-	    ps >> uid >> mode;
+	    string uid, gid, mode, path;
+	    ps >> uid >> gid >> mode;
 	    std::getline (ps, path);
+	    path = trim (path);
 	    long m = strtol (mode.c_str (), NULL, 8);
-	    if ((uid != (*kv)["NODE_UID"] && uid != "0") || (m & 022) != 0 || mode.empty ())
+	    string others = trim ((*kv)["GROUP_OTHERS"]);
+	    if (mode.empty () || (uid != (*kv)["NODE_UID"] && uid != "0"))
 	      {
-		bad_perm = trim (path);
+		bad_perm = path + " is owned by another account (uid " + uid + "); it has to belong to " + r->user + " or to root";
+	      }
+	    else if ((m & 002) != 0)
+	      {
+		bad_perm = path + " is writable by everyone (mode " + mode + "); run on the node: chmod o-w " + path;
+	      }
+	    else if ((m & 020) != 0 && ((*kv)["OWNER_GID"].empty () || gid != (*kv)["OWNER_GID"]))
+	      {
+		bad_perm = path + " is writable by its group (mode " + mode + ", gid " + gid
+			   + "), which is not the primary group of the script's owner; run on the node: chmod g-w " + path;
+	      }
+	    else if ((m & 020) != 0 && !others.empty ())
+	      {
+		bad_perm = path + " is writable by its group (mode " + mode + "), and the group has other users (" + others
+			   + "); run on the node: chmod g-w " + path;
 	      }
 	  }
       }
@@ -2175,7 +2282,7 @@ echo "CHECK_DONE=yes"
       }
     else if (!bad_perm.empty ())
       {
-	set_error (r, "node_script_unsafe", bad_perm + " is writable by others or owned by another account");
+	set_error (r, "node_script_unsafe", bad_perm);
       }
   }
 }

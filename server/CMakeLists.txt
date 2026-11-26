@@ -276,6 +276,10 @@ install(TARGETS cm_admin cub_manager
 # The HA node-adding scripts: ha_add_nodes.sh runs on the server the manager is on, ha_node.sh on every node
 # (so every node needs this package), ha_askpass.sh hands the ssh client a node's password once, and
 # ha_watch.sh logs out of the nodes when ha_add_nodes.sh ends.
+# Their folder and the files are writable by the owner only (755): the manager refuses scripts that others can change.
+install(DIRECTORY DESTINATION ${CMS_SHAREDIR}/cms
+  DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  COMPONENT Manager)
 foreach(script ${CMS_HA_SCRIPTS})
   install(PROGRAMS ${CMS_HA_SCRIPT_DIR}/${script}
     DESTINATION ${CMS_SHAREDIR}/cms COMPONENT Manager)
