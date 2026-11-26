@@ -930,7 +930,7 @@ ext_ha_add_nodes (Json::Value &request, Json::Value &response)
 	}
     }
 
-  string uuid, dir;
+  string uuid, dir, old_pid;
   vector<string> args;
   if (action == "plan" || action == "run")
     {
@@ -1046,6 +1046,7 @@ ext_ha_add_nodes (Json::Value &request, Json::Value &response)
 	  return give_up ("no such job: " + uuid);
 	}
       std::map<string, string> job = key_values (state_of (dir, "job"));
+      old_pid = job["pid"];
       if (job["status"] == "running" && proc_start ((pid_t) atoi (job["pid"].c_str ())) == job["pid_start"])
 	{
 	  return give_up ("the job is still running: " + uuid);
@@ -1133,7 +1134,22 @@ ext_ha_add_nodes (Json::Value &request, Json::Value &response)
   argv.insert (argv.end (), args.begin (), args.end ());
   pid_t pid = spawn (argv, -1, -1, true);
   int st = 0;
-  if (pid < 0 || waitpid (pid, &st, 0) != pid)
+  bool spawned = pid >= 0 && waitpid (pid, &st, 0) == pid;
+  if (spawned)
+    {
+      /* answer once the script has written its first state: a status call right after this answer then sees
+         this job running at its first step (rollback and cleanup: not the earlier job's end state) */
+      for (int i = 0; i < 100; i++)
+	{
+	  std::map<string, string> now = key_values (state_of (dir, "job"));
+	  if (!now["pid"].empty () && now["pid"] != old_pid)
+	    {
+	      break;
+	    }
+	  usleep (100 * 1000);
+	}
+    }
+  if (!spawned)
     {
       string q;
       run_collect ({ helper_path (), "quit", "--agent", sock }, -1, &q, 5);
@@ -1247,7 +1263,7 @@ ext_ha_add_nodes_status (Json::Value &request, Json::Value &response)
   Json::Value steps (Json::arrayValue);
   std::istringstream ss (state_of (dir, "steps"));
   string line;
-  int cur = 0;
+  int cur = 0, first_pending = 0;
   while (std::getline (ss, line))
     {
       vector<string> f = split (line, '\t');
@@ -1268,7 +1284,15 @@ ext_ha_add_nodes_status (Json::Value &request, Json::Value &response)
 	{
 	  cur = (int) steps.size () + 1;
 	}
+      if (first_pending == 0 && f[5] == "pending")
+	{
+	  first_pending = (int) steps.size () + 1;
+	}
       steps.append (s);
+    }
+  if (cur == 0 && status == "running" && first_pending > 0)
+    {
+      cur = first_pending;	/* between two steps: the one that comes next */
     }
   response["steps"] = steps;
   response["step_count"] = (int) steps.size ();

@@ -1500,8 +1500,19 @@ finish() {   # finish <status>
   exit 0
 }
 
-JOB[uuid]=$UUID; JOB[action]=$ACTION; JOB[status]=running; JOB[phase]=run; JOB[started_at]=$(epoch); JOB[pid]=$$
+# rollback and cleanup work on an earlier job's folder: keep what describes that job
+if [ "$ACTION" = rollback ] || [ "$ACTION" = cleanup ]; then
+  while IFS= read -r kvl; do
+    case ${kvl%%=*} in case|db_names|kept|downtime_sec) JOB[${kvl%%=*}]=${kvl#*=} ;; esac
+  done < <(cat "$JOB_DIR/job" 2>/dev/null)
+fi
+JOB[uuid]=$UUID; JOB[action]=$ACTION; JOB[status]=running; JOB[phase]=$([ "$ACTION" = rollback ] && echo rollback || echo run); JOB[started_at]=$(epoch); JOB[pid]=$$
 JOB[pid_start]=$(proc_start $$)
+# the step table first, so the first state the manager sees already has a running step
+if [ "$ACTION" = plan ] || [ "$ACTION" = run ]; then
+  S_ID=(precheck) S_TITLE=("Check this server") S_NODE=("") S_DB=("") S_STATE=(running) S_DETAIL=("") S_STAGE=(S1)
+  steps_write
+fi
 job_write
 log "$PROG $ACTION (job $UUID)"
 if ! lock_edit lock_take_fn; then
@@ -1608,7 +1619,7 @@ for i in "${!S_ID[@]}"; do
   fi
   if [ "$RC" = 124 ]; then
     if may_still_run "${LAST_ACTION#* }"; then FAIL_CODE=no_response; FAIL_MSG="no answer in time: $FAIL_MSG"
-    else FAIL_CODE=unreachable; FAIL_MSG="no answer in time from ${LAST_ACTION%% *} (${LAST_ACTION#* }), taken as a lost connection: $FAIL_MSG"
+    else FAIL_CODE=no_answer; FAIL_MSG="no answer in time from ${LAST_ACTION%% *} (${LAST_ACTION#* }), taken as a lost connection: $FAIL_MSG"
     fi
   fi
   [ "$CANCEL" = 1 ] && [ "$FAIL_CODE" != no_response ] && { FAIL_CODE=cancelled; FAIL_MSG="cancelled during ${S_ID[$i]}${FAIL_MSG:+ ($FAIL_MSG)}"; }

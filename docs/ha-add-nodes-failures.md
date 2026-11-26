@@ -34,8 +34,8 @@
 
 ### 2.1 ssh 접속 실패·끊김 (명령이 끝난 뒤 판단)
 
-- 망이 끊겨 패킷이 버려지면(TCP가 응답 없이 멈춤) 헬퍼는 `unreachable`을 내지 못하고 명령의 제한 시간만 지남. 그래서 시간 초과는 명령 종류로 나눔
-  - 노드에서 바로 끝나는 명령(파일·폴더 고치기, 조회: `conf_edit`, `dbtxt_put`, `mkdir`, `exists`, `keep_old`, `remove`, `mode`, `hb_status` 등): 답이 없으면 연결이 끊긴 것으로 봄. 오류 `unreachable`, 아래 표대로 되돌림
+- 망이 끊겨 패킷이 버려지면(TCP가 응답 없이 멈춤) 헬퍼는 접속 실패(`unreachable`)를 내지 못하고 명령의 제한 시간만 지남. 그래서 시간 초과는 명령 종류로 나눔
+  - 노드에서 바로 끝나는 명령(파일·폴더 고치기, 조회: `conf_edit`, `dbtxt_put`, `mkdir`, `exists`, `keep_old`, `remove`, `mode`, `hb_status` 등): 답이 없으면 연결이 끊긴 것으로 봄. 오류 `no_answer`(접속 자체가 안 되는 `unreachable`과 구분), 아래 표대로 되돌림
   - 오래 걸리거나 CUBRID 프로세스를 띄우고 내리는 명령(`restoreslave`, 첫 `copylogdb`, `backupdb`, heartbeat start·stop, server start·stop, cub_master, `reload`, `repl`): 노드에서 아직 돌 수 있으므로 2.6대로 `rollback_blocked`
 - 되돌리기 중 한 노드가 답하지 않으면(시간 초과 또는 헬퍼 오류) 그 노드의 남은 줄은 이번에는 시도하지 않고 `unrestored[]`에 남김. 그 노드 때문에 줄마다 제한 시간을 기다리지 않음
 
@@ -43,7 +43,7 @@
 |---|---|---|---|---|---|
 | S2·S3 | X·Y·E | 헬퍼가 `unreachable` | 멈춤(바꾼 것 없음) | `fail` | 망·sshd 확인 후 다시 `plan` |
 | S10 | X·Y | 전송 중 끊김 | 헬퍼가 다시 접속해 끊긴 자리부터 최대 3번 이어 올림. 그래도 안 되면 실패 | 3번 안에 되면 계속, 아니면 `fail` | 망 확인 후 다시 실행 |
-| S10 받는 폴더 만들기, S11 설정, S12 보관 | X·Y | 명령 결과 없음 또는 시간 초과(바로 끝나는 명령) | 그 단계 실패(`unreachable`) → 되돌리기. 되돌리기에서 그 노드에 다시 접속(헬퍼가 새 세션). 그래도 답이 없으면 그 노드 줄은 건너뛰고 다른 노드는 되돌림 | 접속되면 `fail`, 안 되면 `rollback_failed` | 안 되면 노드가 살아난 뒤 `rollback` |
+| S10 받는 폴더 만들기, S11 설정, S12 보관 | X·Y | 명령 결과 없음 또는 시간 초과(바로 끝나는 명령) | 그 단계 실패(`no_answer`) → 되돌리기. 되돌리기에서 그 노드에 다시 접속(헬퍼가 새 세션). 그래도 답이 없으면 그 노드 줄은 건너뛰고 다른 노드는 되돌림 | 접속되면 `fail`, 안 되면 `rollback_failed` | 안 되면 노드가 살아난 뒤 `rollback` |
 | S13~S16 | X·Y | 명령 결과 없음 | 그 단계 실패 → 되돌리기(위와 같음). 시간 초과면 2.6 | 접속되면 `fail`, 안 되면 `rollback_failed` | 같음 |
 | S17·S18 | E | 같음(S17 설정 고치기는 바로 끝나는 명령, `reload`·`repl start`는 2.6) | 같음. 앞서 등록한 E도 거꾸로 되돌림 | 같음 | 같음. 수동 절차 R2 |
 | 되돌리기 | 아무 노드 | 되돌리기 명령 결과 없음 | 그 줄을 건너뛰고 계속, 끝에 `unrestored[]` | `rollback_failed` | 노드가 살아난 뒤 `rollback`(끝난 줄은 건너뜀) |
