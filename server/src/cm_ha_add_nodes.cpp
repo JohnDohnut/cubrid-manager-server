@@ -887,6 +887,10 @@ ext_ha_add_nodes (Json::Value &request, Json::Value &response)
 	{
 	  args.push_back ("--confirm-other-db-restart");
 	}
+      if (req_str (request, "confirm_new_node_db_restart") == "yes")
+	{
+	  args.push_back ("--confirm-new-node-db-restart");
+	}
       for (node_in &n : news)
 	{
 	  args.insert (args.end (), { "--new", n.role + ":" + n.host + ":" + n.port + ":" + n.user });
@@ -1114,6 +1118,7 @@ ext_ha_add_nodes_status (Json::Value &request, Json::Value &response)
       s["db"] = f[4];
       s["state"] = f[5];
       s["detail"] = f[6];
+      s["stage"] = f.size () > 7 ? f[7] : "";
       if (f[5] == "running" || (cur == 0 && f[5] == "failed"))
 	{
 	  cur = (int) steps.size () + 1;

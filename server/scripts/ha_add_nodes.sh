@@ -21,6 +21,7 @@
 #     --db <db>                       (single server only) a database to put into HA; repeat for more
 #     --confirm-master-restart        (single server) the running databases restart
 #     --confirm-other-db-restart      (single server) databases staying single but running restart too
+#     --confirm-new-node-db-restart   other databases running on a new node restart (they stay single)
 #     --new <slave|replica>:<host>:<port>:<user>[:<fingerprint>]       a new node; repeat
 #     --existing <host>:<port>:<user>[:<fingerprint>]                  an existing node of the group; repeat
 #     --repl-log-home <path>          new nodes' replication log folder (default: their $CUBRID_DATABASES)
@@ -214,6 +215,20 @@ node_info() {
   echo "HA_COPY_LOG_BASE=$(conf_get "$f" "[common]" ha_copy_log_base)"
   if cub_master_running; then echo "CUB_MASTER=yes"; else echo "CUB_MASTER=no"; fi
   echo "SERVERS=$(cubrid server status 2>/dev/null </dev/null | awk '$1 == "Server" || $1 == "HA-Server" { print $2 }' | tr '\n' ' ')"
+  echo "DBTXT=$(awk '$1 !~ /^#/ && NF >= 4 { print $1 }' "$CUBRID_DATABASES/databases.txt" 2>/dev/null | tr '\n' ' ')"
+}
+
+# the nearest folder of a path that exists (the path itself when it exists)
+existing_ancestor() { local p=$1; while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done; printf '%s' "$p"; }
+
+node_writable() {   # node writable <path>... : "OK <path> <free bytes>" or "NO <path> <folder that is not writable>"
+  local p a
+  for p in "$@"; do
+    a=$(existing_ancestor "$p")
+    if [ -d "$a" ] && [ -w "$a" ]; then echo "OK $p $(df -Pk "$a" 2>/dev/null | awk 'NR == 2 { print $4 * 1024 }')"
+    else echo "NO $p $a"
+    fi
+  done
 }
 
 node_resolve() {   # node resolve <name>... : prints the names that do not resolve
@@ -222,7 +237,7 @@ node_resolve() {   # node resolve <name>... : prints the names that do not resol
   echo "UNRESOLVED=${bad# }"
 }
 
-node_free_bytes() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 * 1024 }'; }
+node_free_bytes() { df -Pk "$(existing_ancestor "$1")" 2>/dev/null | awk 'NR == 2 { print $4 * 1024 }'; }
 
 node_mode() {   # node mode <db>... : "<db> <active|standby|...>"
   local db out t0
@@ -340,8 +355,9 @@ node_clear() {
 node_remove() { local p; for p in "$@"; do rm -rf "$p"; done; }
 
 node_restore() {   # node restore <db> <backup dir> <log path> <master> <source state>
+  # -u: the volumes go where this node's databases.txt says, not where they were on the master
   cp -f "$2/${1}_bkvinf" "$3/" || return 1
-  cubrid restoreslave -s "$5" -m "$4" -B "$2" "$1" 2>&1 </dev/null
+  cubrid restoreslave -s "$5" -m "$4" -u -B "$2" "$1" 2>&1 </dev/null
 }
 
 node_first_copylog() {   # node first_copylog <db> <master> <dir>
@@ -358,6 +374,7 @@ node_main() {
     info) node_info ;;
     resolve) node_resolve "$@" ;;
     free) node_free_bytes "$@" ;;
+    writable) node_writable "$@" ;;
     mode) node_mode "$@" ;;
     conf_edit) node_conf_edit "$@" ;;
     dbtxt_put) node_dbtxt_put "$@" ;;
@@ -409,7 +426,7 @@ usage() { sed -n '/^# ha_add_nodes.sh - /,/^# Every value/p' "$SELF" | sed '$d; 
 ACTION=${1:-}
 shift || true
 JOB_DIR="" AGENT="" MASTER_HOST="" HA_GROUP=cubrid HA_PORT_ID=59901 REPL_HOME="" BK_PATH="" RBK_PATH=""
-CONFIRM_RESTART=0 CONFIRM_OTHERS=0 ROLLBACK_CONVERT=0 START_HA=1
+CONFIRM_RESTART=0 CONFIRM_OTHERS=0 CONFIRM_NEWDB=0 ROLLBACK_CONVERT=0 START_HA=1
 DBS_ARG=() NEW_SPEC=() EXIST_SPEC=() KEEP_ARG=()
 while [ $# -gt 0 ]; do
   case $1 in
@@ -419,6 +436,7 @@ while [ $# -gt 0 ]; do
     --db) DBS_ARG+=("$2"); shift 2 ;;
     --confirm-master-restart) CONFIRM_RESTART=1; shift ;;
     --confirm-other-db-restart) CONFIRM_OTHERS=1; shift ;;
+    --confirm-new-node-db-restart) CONFIRM_NEWDB=1; shift ;;
     --new) NEW_SPEC+=("$2"); shift 2 ;;
     --existing) EXIST_SPEC+=("$2"); shift 2 ;;
     --repl-log-home) REPL_HOME=$2; shift 2 ;;
@@ -456,17 +474,17 @@ job_write() {
 }
 job_set() { JOB[$1]=$2; job_write; }
 
-S_ID=() S_TITLE=() S_NODE=() S_DB=() S_STATE=() S_DETAIL=()
+S_ID=() S_TITLE=() S_NODE=() S_DB=() S_STATE=() S_DETAIL=() S_STAGE=()
 steps_write() {
   local i tmp="$JOB_DIR/steps.tmp"
   : > "$tmp"
   for i in "${!S_ID[@]}"; do
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$((i + 1))" "${S_ID[$i]}" "${S_TITLE[$i]}" "${S_NODE[$i]}" "${S_DB[$i]}" \
-      "${S_STATE[$i]}" "$(one_line "${S_DETAIL[$i]}")" >> "$tmp"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$((i + 1))" "${S_ID[$i]}" "${S_TITLE[$i]}" "${S_NODE[$i]}" "${S_DB[$i]}" \
+      "${S_STATE[$i]}" "$(one_line "${S_DETAIL[$i]}")" "${S_STAGE[$i]:-}" >> "$tmp"
   done
   mv -f "$tmp" "$JOB_DIR/steps"
 }
-step_add() { S_ID+=("$1"); S_TITLE+=("$2"); S_NODE+=("$3"); S_DB+=("$4"); S_STATE+=(pending); S_DETAIL+=(""); }
+step_add() { S_STAGE+=("$1"); S_ID+=("$2"); S_TITLE+=("$3"); S_NODE+=("$4"); S_DB+=("$5"); S_STATE+=(pending); S_DETAIL+=(""); }
 step_set() { S_STATE[$1]=$2; [ $# -ge 3 ] && S_DETAIL[$1]=$3; steps_write; }
 
 # ------------------------------------------------ lock: content-based, flock only while the file is changed
@@ -720,11 +738,13 @@ st_precheck() {
       WARN+=("$db has automatic backup or volume adding set in the manager; avoid running them while this job runs")
     fi
   done
+  # HA replicates only tables with a primary key; listing the others needs a database login, which this
+  # script does not get (the manager can check with the database account the screen logged in with)
+  WARN+=("tables without a primary key are not replicated; not checked here (no database account): ${D[*]}")
   BK_PATH=${BK_PATH:-$CUBRID_DATABASES/ha_add_nodes_backup}
   # backup room here: the size of the databases' volumes
   local need=0 free sz
   for db in "${D[@]}"; do sz=$(du -sk "${DB_VOL[$db]}" 2>/dev/null | awk '{ print $1 * 1024 }'); need=$(( need + ${sz:-0} )); done
-  mkdir -p "$BK_PATH" || { fail precheck_failed "cannot create $BK_PATH"; return 1; }
   free=$(node_free_bytes "$BK_PATH")
   JOB[backup_bytes]=$need
   [ "${free:-0}" -gt "$need" ] || { fail precheck_failed "not enough room in $BK_PATH (${free:-0} bytes free, about $need needed)"; return 1; }
@@ -736,7 +756,18 @@ st_precheck() {
 
 # ------------------------------------------------ S2 node checks
 
-declare -A N_CUBDB=() N_HOME=() N_MASTER=() N_COPYBASE=()
+declare -A N_CUBDB=() N_HOME=() N_MASTER=() N_COPYBASE=() N_OTHERS_UP=() N_OTHERS_REG=() NV=() NLG=() NLOB=()
+
+# a path of this server rebased onto a new node: under its $CUBRID_DATABASES if it is under ours, else as it is
+node_path() {   # node_path <host> <path>
+  local p=$2
+  case $p in
+    "$CUBRID_DATABASES") printf '%s' "${N_CUBDB[$1]}" ;;
+    "$CUBRID_DATABASES"/*) printf '%s' "${N_CUBDB[$1]}${p#"$CUBRID_DATABASES"}" ;;
+    *) printf '%s' "$p" ;;
+  esac
+}
+rbk_root() { printf '%s' "${RBK_PATH:-${N_CUBDB[$1]}/ha_add_nodes_backup}"; }
 all_names() { printf '%s ' "$L" "${EX_HOST[@]}" "${NEW_HOST[@]}"; }
 
 st_node_check() {   # st_node_check <host> <existing|new> <role>
@@ -770,12 +801,56 @@ st_node_check() {   # st_node_check <host> <existing|new> <role>
     for db in "${D[@]}"; do
       [[ " $servers " != *" $db "* ]] || { fail slave_db_running "$h: database $db is running there; stop it first"; return 1; }
     done
-    if [ -n "${servers// /}" ] && [ "${N_MASTER[$h]}" = yes ] && [ "$START_HA" = 1 ]; then
-      fail other_db_running "$h: other databases run there ($servers); cub_master has to restart in HA mode, which would stop them. Stop them first"; return 1
-    fi
+    # other databases of the node stay single: [@db] ha_mode=off; the running ones restart with the HA start
+    local x reg=""
+    N_OTHERS_UP[$h]=""
+    for x in $servers; do [[ " ${D[*]} " == *" $x "* ]] || N_OTHERS_UP[$h]+="$x "; done
+    for x in $(kv "${NODE_INFO[$h]}" DBTXT); do [[ " ${D[*]} " == *" $x "* ]] || reg+="$x "; done
+    N_OTHERS_REG[$h]=$reg
     N_HOME[$h]=${REPL_HOME:-${N_CUBDB[$h]}}
     N_COPYBASE[$h]=${N_HOME[$h]}
+    # paths on this node: under its own $CUBRID_DATABASES when the master's are under the master's
+    for db in "${D[@]}"; do
+      NV[$h/$db]=$(node_path "$h" "${DB_VOL[$db]}")
+      NLG[$h/$db]=$(node_path "$h" "${DB_LOG[$db]}")
+      NLOB[$h/$db]=""
+      [ -n "${DB_LOB[$db]}" ] && NLOB[$h/$db]="file:$(node_path "$h" "${DB_LOB[$db]#file:}")"
+    done
   fi
+  return 0
+}
+
+# ------------------------------------------------ S3 preflight: what the later steps write is tried first
+
+st_preflight() {   # <host>: L tries its backup folder; a new node its receiving folder (a small transfer),
+                   # the folders the restore writes to and the replication log folder
+  local h=$1 db need=0 sz p r
+  if [ "$h" = "$L" ]; then
+    on_node "$L" 30 0 writable "$BK_PATH"
+    [[ $OUT == OK* ]] || { fail precheck_failed "cannot write $BK_PATH ($(one_line "$OUT"))"; return 1; }
+    return 0
+  fi
+  r=$(rbk_root "$h")
+  local paths=("$r" "${N_HOME[$h]}")
+  for db in "${D[@]}"; do paths+=("${NV[$h/$db]}" "${NLG[$h/$db]}"); done
+  on_node "$h" 30 0 writable "${paths[@]}"
+  if [[ $OUT == *"NO "* ]]; then
+    fail precheck_failed "$h cannot write: $(printf '%s\n' "$OUT" | awk '$1 == "NO" { printf "%s (%s is not writable) ", $2, $3 }')"
+    return 1
+  fi
+  # room: the backup arrives, then the restore writes about the same again
+  need=$(( ${JOB[backup_bytes]:-0} ))
+  p=$(printf '%s\n' "$OUT" | awk -v r="$r" '$1 == "OK" && $2 == r { print $3 }')
+  [ "${p:-0}" -gt "$need" ] || { fail precheck_failed "$h: not enough room for the backup under $r (${p:-0} bytes free, about $need needed)"; return 1; }
+  # a small transfer into a folder of its own, removed again
+  local t="$r/$TAG.preflight" made=0
+  on_node "$h" 30 0 exists "$r"; [[ $OUT == *"MISSING"* ]] && made=1
+  on_node "$h" 30 0 mkdir "$t" || { fail transfer_failed "$h: cannot create $t"; return 1; }
+  run_bg 120 1 "$CM_SSH" put --agent "$AGENT" "$h" "$SELF" "$t/transfer-test"
+  local prc=$RC pout=$OUT
+  on_node "$h" 30 0 remove "$t"
+  [ $made = 1 ] && on_node "$h" 30 0 rmdir_empty "$r"
+  [ "$prc" -eq 0 ] || { fail transfer_failed "$h: a test transfer failed: $(printf '%s' "$pout" | grep '^cm_ssh: ' | tail -1)"; return 1; }
   return 0
 }
 
@@ -865,14 +940,19 @@ st_convert_start_others() {
 st_new_config() {   # <no> <host> <role>
   local no=$1 h=$2 role=$3 cubrid cubdb k v args=() db hosts x
   cubrid=$(kv "${NODE_INFO[$h]}" CUBRID); cubdb=${N_CUBDB[$h]}
-  # a cub_master that ran without HA is taken down at HA start; its undo starts it again once the settings are back
-  [ "${N_MASTER[$h]}" = yes ] && [ "$START_HA" = 1 ] && undo_add "$no" "$h" master_start
+  # what HA start takes down comes back once the settings are back: first cub_master (if it ran without HA),
+  # then the other databases that ran (the undo log runs backwards, so they are recorded the other way round)
+  if [ "$START_HA" = 1 ]; then
+    [ -n "${N_OTHERS_UP[$h]// /}" ] && undo_add "$no" "$h" server_start ${N_OTHERS_UP[$h]}
+    [ "${N_MASTER[$h]}" = yes ] && undo_add "$no" "$h" master_start
+  fi
   undo_add "$no" "$h" undo_file "$cubrid/conf/cubrid.conf" "$TAG.$no"
   if [ "$role" = slave ]; then
     args=("[common]" ha_mode on "[common]" force_remove_log_archives no)
   else
     args=("[common]" ha_mode replica)
   fi
+  for x in ${N_OTHERS_REG[$h]}; do args+=("[@$x]" ha_mode off); done
   on_node "$h" 60 0 conf_edit "$cubrid/conf/cubrid.conf" "$TAG.$no" "${args[@]}" || { fail config_edit_failed "$h cubrid.conf: $OUT"; return 1; }
   # the HA settings of this server (ha_port_id, ha_apply_max_mem_size, ...) with the final lists, in the same order
   args=()
@@ -886,11 +966,17 @@ st_new_config() {   # <no> <host> <role>
   [ "${N_HOME[$h]}" != "$cubdb" ] && args+=("[common]" ha_copy_log_base "${N_HOME[$h]}")
   undo_add "$no" "$h" undo_file "$cubrid/conf/cubrid_ha.conf" "$TAG.$no"
   on_node "$h" 60 0 conf_edit "$cubrid/conf/cubrid_ha.conf" "$TAG.$no" "${args[@]}" || { fail config_edit_failed "$h cubrid_ha.conf: $OUT"; return 1; }
+  # restoreslave computes the copied log path from this folder (realpath): it has to exist before the restore
+  on_node "$h" 30 0 exists "${N_HOME[$h]}"
+  if [[ $OUT == *MISSING* ]]; then
+    undo_add "$no" "$h" rmdir_empty "${N_HOME[$h]}"
+    on_node "$h" 30 0 mkdir "${N_HOME[$h]}" || { fail command_failed "$h: cannot create ${N_HOME[$h]}"; return 1; }
+  fi
   undo_add "$no" "$h" undo_file "$cubdb/databases.txt" "$TAG.$no"
   for db in "${D[@]}"; do
     hosts=$(list_hosts "$(final_node_list)"); hosts=${hosts// /:}
     for x in ${DB_HOSTS[$db]//:/ }; do [[ :$hosts: == *":$x:"* || $x = localhost ]] || hosts+=":$x"; done
-    on_node "$h" 60 0 dbtxt_put "$TAG.$no" "$db" "${DB_VOL[$db]}" "$hosts" "${DB_LOG[$db]}" "${DB_LOB[$db]}" || { fail config_edit_failed "$h databases.txt: $OUT"; return 1; }
+    on_node "$h" 60 0 dbtxt_put "$TAG.$no" "$db" "${NV[$h/$db]}" "$hosts" "${NLG[$h/$db]}" "${NLOB[$h/$db]}" || { fail config_edit_failed "$h databases.txt: $OUT"; return 1; }
   done
   log "$h ($role): ha_node_list=$(final_node_list) ha_replica_list=$(final_replica_list)"
 }
@@ -905,13 +991,14 @@ st_backup() {   # <no> <db>
   fi
   undo_add "$no" "$L" remove "$dir"
   mkdir -p "$dir" || { fail command_failed "cannot create $dir"; return 1; }
+  chmod 700 "$BK_PATH/$TAG"
   on_node "$L" 21600 0 cubrid backupdb -C -D "$dir" -o "$dir/backup.out" --no-check "$db@localhost" \
     || { fail command_failed "cubrid backupdb $db failed ($RC)"; return 1; }
 }
 
 st_send_backup() {   # <no> <host> <db>
   local no=$1 h=$2 db=$3 src="$BK_PATH/$TAG/$3" dst f
-  dst="${RBK_PATH:-${N_CUBDB[$h]}/ha_add_nodes_backup}/$TAG/$db"
+  dst="$(rbk_root "$h")/$TAG/$db"
   if [ -z "${PARENT_RECORDED[$h]:-}" ]; then
     undo_add "$no" "$h" rmdir_empty "${dst%/*/*}"
     undo_add "$no" "$h" remove "${dst%/*}"
@@ -932,7 +1019,7 @@ st_send_backup() {   # <no> <host> <db>
 declare -A CLEAR_AT_RESTORE=()
 st_keep_old() {   # <no> <host> <db>
   local no=$1 h=$2 db=$3 l kind p
-  on_node "$h" 600 0 keep_old ".ha_add_nodes_$TAG" "$db" "${DB_VOL[$db]}" "${DB_LOG[$db]}" "${N_HOME[$h]}"
+  on_node "$h" 600 0 keep_old ".ha_add_nodes_$TAG" "$db" "${NV[$h/$db]}" "${NLG[$h/$db]}" "${N_HOME[$h]}"
   local rc=$RC
   while read -r kind p; do
     case $kind in
@@ -947,11 +1034,11 @@ st_keep_old() {   # <no> <host> <db>
 
 st_restore() {   # <no> <host> <db>
   local no=$1 h=$2 db=$3 dst
-  dst="${RBK_PATH:-${N_CUBDB[$h]}/ha_add_nodes_backup}/$TAG/$db"
+  dst="$(rbk_root "$h")/$TAG/$db"
   # what restoreslave writes goes into folders keep_old created or found empty: the undo clears just those
   local how p
   while read -r how p; do [ -n "$p" ] && undo_add "$no" "$h" clear "$how" "$p"; done <<< "${CLEAR_AT_RESTORE[$h/$db]:-}"
-  on_node "$h" 21600 0 restore "$db" "$dst" "${DB_LOG[$db]}" "$MASTER_HOST" "$SRC_STATE" \
+  on_node "$h" 21600 0 restore "$db" "$dst" "${NLG[$h/$db]}" "$MASTER_HOST" "$SRC_STATE" \
     || { fail command_failed "$h: cubrid restoreslave $db failed ($RC): $(one_line "$OUT" | tail -c 300)"; return 1; }
 }
 
@@ -965,12 +1052,20 @@ st_first_copylog() {   # <no> <host> <db>
 # ------------------------------------------------ D: HA start on the new nodes
 
 st_new_ha_start() {   # <no> <host>
-  local no=$1 h=$2
+  local no=$1 h=$2 others=${N_OTHERS_UP[$2]}
+  # the node's other running databases stop (cub_master restarts in HA mode) and run again without HA
+  if [ -n "${others// /}" ]; then
+    on_node "$h" 600 0 server_stop $others || { fail command_failed "$h: cubrid server stop $others failed: $(one_line "$OUT")"; return 1; }
+  fi
   if [ "${N_MASTER[$h]}" = yes ]; then
     on_node "$h" 120 0 master_down || { fail command_failed "$h: cub_master did not stop"; return 1; }
   fi
   undo_add "$no" "$h" ha_stop
   on_node "$h" 600 0 ha_start || { fail command_failed "$h: cubrid heartbeat start failed: $(one_line "$OUT" | tail -c 300)"; return 1; }
+  if [ -n "${others// /}" ]; then
+    undo_add "$no" "$h" server_stop $others
+    on_node "$h" 600 0 server_start $others || { fail command_failed "$h: cubrid server start $others (without HA) failed: $(one_line "$OUT")"; return 1; }
+  fi
 }
 
 st_peer_repl_start() {   # <no> <host>: copies from the other new slaves that heartbeat start did not start
@@ -1066,55 +1161,55 @@ st_cleanup() {
   rm -rf "${BK_PATH:?}/$TAG"
   rmdir "$BK_PATH" 2>/dev/null
   for h in "${NEW_HOST[@]}"; do
-    on_node "$h" 600 0 remove "${RBK_PATH:-${N_CUBDB[$h]}/ha_add_nodes_backup}/$TAG"
-    on_node "$h" 60 0 rmdir_empty "${RBK_PATH:-${N_CUBDB[$h]}/ha_add_nodes_backup}"
+    on_node "$h" 600 0 remove "$(rbk_root "$h")/$TAG"
+    on_node "$h" 60 0 rmdir_empty "$(rbk_root "$h")"
   done
   return 0
 }
 
 # ------------------------------------------------ step list
 
+# One cycle for every case; the promotion (S4-S8) is there only for a single server. Stage numbers (S1..S21)
+# never go backwards: a stage done per database and per node is done for all of them before the next stage.
 build_steps() {
-  local h db i x
-  S_ID=() S_TITLE=() S_NODE=() S_DB=() S_STATE=() S_DETAIL=()
-  step_add precheck "Check this server" "" ""
-  for i in "${!EX_HOST[@]}"; do step_add node_check "Check an existing node" "${EX_HOST[$i]}" ""; done
-  for h in "${NEW_HOST[@]}"; do step_add node_check "Check a new node" "$h" ""; done
+  local h db
+  S_ID=() S_TITLE=() S_NODE=() S_DB=() S_STATE=() S_DETAIL=() S_STAGE=()
+  step_add S1 precheck "Check this server" "" ""
+  for h in "${EX_HOST[@]}"; do step_add S2 node_check "Check an existing node" "$h" ""; done
+  for h in "${NEW_HOST[@]}"; do step_add S2 node_check "Check a new node" "$h" ""; done
+  step_add S3 preflight "Try the backup folder" "$L" ""
+  for h in "${NEW_HOST[@]}"; do step_add S3 preflight "Try a transfer and the folders the restore writes" "$h" ""; done
   if [ "$LOCAL_STATE" = single ]; then
-    step_add convert_stop "Promote to HA master: stop the running databases (service stops)" "$L" ""
-    step_add convert_config "Promote to HA master: write the HA settings" "$L" ""
-    step_add convert_restart "Promote to HA master: start the HA databases under heartbeat" "$L" ""
-    step_add convert_verify "Promote to HA master: check that they are the active master (service resumes)" "$L" ""
-    step_add convert_start_others "Promote to HA master: start the other databases again without HA" "$L" ""
+    step_add S4 convert_stop "Promote to HA master: stop the running databases (service stops)" "$L" ""
+    step_add S5 convert_config "Promote to HA master: write the HA settings" "$L" ""
+    step_add S6 convert_restart "Promote to HA master: start the HA databases under heartbeat" "$L" ""
+    step_add S7 convert_verify "Promote to HA master: check that they are the active master (service resumes)" "$L" ""
+    step_add S8 convert_start_others "Promote to HA master: start the other databases again without HA" "$L" ""
   fi
-  for h in "${NEW_HOST[@]}"; do step_add new_config "Write the new node's HA settings" "$h" ""; done
-  for db in "${D[@]}"; do
-    step_add backup "Back up the database online" "$L" "$db"
-    for h in "${NEW_HOST[@]}"; do
-      step_add send_backup "Send the backup" "$h" "$db"
-      step_add keep_old_db "Keep the old database aside" "$h" "$db"
-      step_add restore "Restore" "$h" "$db"
-      step_add first_copylog "First copy of the replication log" "$h" "$db"
-    done
-  done
+  for db in "${D[@]}"; do step_add S9 backup "Back up the database online" "$L" "$db"; done
+  for db in "${D[@]}"; do for h in "${NEW_HOST[@]}"; do step_add S10 send_backup "Send the backup" "$h" "$db"; done; done
+  for h in "${NEW_HOST[@]}"; do step_add S11 new_config "Write the new node's HA settings" "$h" ""; done
+  for db in "${D[@]}"; do for h in "${NEW_HOST[@]}"; do step_add S12 keep_old_db "Keep the old database aside" "$h" "$db"; done; done
+  for db in "${D[@]}"; do for h in "${NEW_HOST[@]}"; do step_add S13 restore "Restore" "$h" "$db"; done; done
+  for db in "${D[@]}"; do for h in "${NEW_HOST[@]}"; do step_add S14 first_copylog "First copy of the replication log" "$h" "$db"; done; done
   if [ "$START_HA" = 1 ]; then
-    for h in "${NEW_SLAVES[@]}"; do step_add new_ha_start "Start HA on the new slave" "$h" ""; done
-    for h in "${NEW_REPLICAS[@]}"; do step_add new_ha_start "Start HA on the new replica" "$h" ""; done
+    for h in "${NEW_SLAVES[@]}"; do step_add S15 new_ha_start "Start HA on the new slave" "$h" ""; done
+    for h in "${NEW_REPLICAS[@]}"; do step_add S15 new_ha_start "Start HA on the new replica" "$h" ""; done
     if [ ${#NEW_SLAVES[@]} -ge 2 ]; then
-      for h in "${NEW_SLAVES[@]}"; do step_add peer_repl_start "Start replication between the new slaves" "$h" ""; done
+      for h in "${NEW_SLAVES[@]}"; do step_add S16 peer_repl_start "Start replication between the new slaves" "$h" ""; done
     fi
   fi
-  step_add existing_config "Add the new nodes to the HA settings" "$L" ""
-  for h in "${EX_HOST[@]}"; do step_add existing_config "Add the new nodes to the HA settings" "$h" ""; done
+  step_add S17 existing_config "Add the new nodes to the HA settings" "$L" ""
+  for h in "${EX_HOST[@]}"; do step_add S17 existing_config "Add the new nodes to the HA settings" "$h" ""; done
   if [ ${#NEW_SLAVES[@]} -ge 1 ]; then
-    step_add existing_repl_start "Start replication of the new slaves" "$L" ""
-    for h in "${EX_HOST[@]}"; do step_add existing_repl_start "Start replication of the new slaves" "$h" ""; done
+    step_add S18 existing_repl_start "Start replication of the new slaves" "$L" ""
+    for h in "${EX_HOST[@]}"; do step_add S18 existing_repl_start "Start replication of the new slaves" "$h" ""; done
   fi
   if [ "$START_HA" = 1 ]; then
-    for h in "${NEW_HOST[@]}"; do step_add verify "Check the new node" "$h" ""; done
-    step_add verify_existing "Check that the existing nodes copy the new slaves' logs" "" ""
+    for h in "${NEW_HOST[@]}"; do step_add S19 verify "Check the new node" "$h" ""; done
+    step_add S20 verify_existing "Check that the existing nodes copy the new slaves' logs" "" ""
   fi
-  step_add cleanup "Remove the backup files" "" ""
+  step_add S21 cleanup "Remove the backup files" "" ""
 }
 
 run_step() {   # run_step <index>
@@ -1123,6 +1218,7 @@ run_step() {   # run_step <index>
   for k in "${!NEW_HOST[@]}"; do [ "${NEW_HOST[$k]}" = "$h" ] && role=${NEW_ROLE[$k]}; done
   case $id in
     precheck) st_precheck ;;
+    preflight) st_preflight "$h" ;;
     node_check)
       if [[ " ${EX_HOST[*]} " == *" $h "* ]]; then st_node_check "$h" existing ""; else st_node_check "$h" new "$role"; fi ;;
     convert_stop) st_convert_stop "$no" ;;
@@ -1212,7 +1308,7 @@ json_str() {
 json_arr() { local first=1 x; printf '['; for x in "$@"; do [ $first = 1 ] || printf ','; first=0; json_str "$x"; done; printf ']'; }
 
 write_plan() {
-  local i h first=1 tmp="$JOB_DIR/plan.tmp" final_n final_r k=${#D[@]}
+  local i h db first=1 tmp="$JOB_DIR/plan.tmp" final_n final_r k=${#D[@]}
   final_n=$(final_node_list); final_r=$(final_replica_list)
   {
     printf '{"local":{"host":%s,"state":%s},"case":%s,"master_host":%s,"db_names":%s,' \
@@ -1231,12 +1327,33 @@ write_plan() {
     if [ "$LOCAL_STATE" = single ]; then
       printf '"convert":{"ha_databases":%s,"restart_databases":%s,"other_running_databases":%s,"single_databases":%s},' \
         "$(json_arr "${D[@]}")" "$(json_arr "${UP_BEFORE[@]}")" "$(json_arr "${OTHERS_UP[@]}")" "$(json_arr "${SINGLES[@]}")"
-      local conf=("confirm_master_restart")
-      [ ${#OTHERS_UP[@]} -ge 1 ] && conf+=("confirm_other_db_restart")
-      printf '"confirm_required":%s,' "$(json_arr "${conf[@]}")"
     else
-      printf '"convert":null,"confirm_required":[],'
+      printf '"convert":null,'
     fi
+    local conf=()
+    if [ "$LOCAL_STATE" = single ]; then
+      conf+=("confirm_master_restart")
+      [ ${#OTHERS_UP[@]} -ge 1 ] && conf+=("confirm_other_db_restart")
+    fi
+    for h in "${NEW_HOST[@]}"; do [ -n "${N_OTHERS_UP[$h]// /}" ] && [ "$START_HA" = 1 ] && { conf+=("confirm_new_node_db_restart"); break; }; done
+    printf '"confirm_required":%s,' "$(json_arr "${conf[@]}")"
+    printf '"new_node_databases":['
+    first=1
+    for h in "${NEW_HOST[@]}"; do
+      [ $first = 1 ] || printf ','; first=0
+      printf '{"host":%s,"running":%s,"staying_single":%s}' "$(json_str "$h")" "$(json_arr ${N_OTHERS_UP[$h]})" "$(json_arr ${N_OTHERS_REG[$h]})"
+    done
+    printf '],"node_paths":['
+    first=1
+    for h in "${NEW_HOST[@]}"; do
+      for db in "${D[@]}"; do
+        [ $first = 1 ] || printf ','; first=0
+        printf '{"host":%s,"db":%s,"vol":%s,"log":%s,"lob":%s,"repl_log_home":%s,"receive":%s}' "$(json_str "$h")" "$(json_str "$db")" \
+          "$(json_str "${NV[$h/$db]}")" "$(json_str "${NLG[$h/$db]}")" "$(json_str "${NLOB[$h/$db]}")" "$(json_str "${N_HOME[$h]}")" "$(json_str "$(rbk_root "$h")")"
+      done
+    done
+    printf '],'
+
     printf '"changes":['
     first=1
     for h in "$L" "${EX_HOST[@]}"; do
@@ -1264,9 +1381,8 @@ write_plan() {
     printf '],"warnings":%s,"steps":[' "$(json_arr "${WARN[@]}")"
     for i in "${!S_ID[@]}"; do
       [ "$i" = 0 ] || printf ','
-      local actor=script
-      printf '{"no":%s,"id":%s,"title":%s,"node":%s,"db":%s,"actor":"%s"}' "$((i + 1))" "$(json_str "${S_ID[$i]}")" \
-        "$(json_str "${S_TITLE[$i]}")" "$(json_str "${S_NODE[$i]}")" "$(json_str "${S_DB[$i]}")" "$actor"
+      printf '{"no":%s,"stage":%s,"id":%s,"title":%s,"node":%s,"db":%s,"actor":"script"}' "$((i + 1))" "$(json_str "${S_STAGE[$i]}")" \
+        "$(json_str "${S_ID[$i]}")" "$(json_str "${S_TITLE[$i]}")" "$(json_str "${S_NODE[$i]}")" "$(json_str "${S_DB[$i]}")"
     done
     printf ']}\n'
   } > "$tmp"
@@ -1324,7 +1440,7 @@ if [ "$ACTION" = cleanup ]; then
 fi
 
 # plan and run share the checks
-S_ID=(precheck) S_TITLE=("Check this server") S_NODE=("") S_DB=("") S_STATE=(running) S_DETAIL=("")
+S_ID=(precheck) S_TITLE=("Check this server") S_NODE=("") S_DB=("") S_STATE=(running) S_DETAIL=("") S_STAGE=(S1)
 steps_write
 if ! st_precheck; then
   JOB[error]=$FAIL_CODE; JOB[message]=$FAIL_MSG; JOB[case]=$CASE_NO
@@ -1337,7 +1453,7 @@ steps_write
 JOB[case]=$CASE_NO; JOB[db_names]="${D[*]}"; job_write
 # the node checks (plan: only these, nothing changes)
 for i in "${!S_ID[@]}"; do
-  [ "${S_ID[$i]}" = node_check ] || continue
+  case ${S_ID[$i]} in node_check|preflight) ;; *) continue ;; esac
   step_set "$i" running
   if run_step "$i"; then step_set "$i" done; else
     step_set "$i" failed "$FAIL_MSG"
@@ -1354,9 +1470,17 @@ if [ "$LOCAL_STATE" = single ]; then
   fi
 fi
 
+if [ "$START_HA" = 1 ] && [ "$CONFIRM_NEWDB" != 1 ]; then
+  for h in "${NEW_HOST[@]}"; do
+    if [ -n "${N_OTHERS_UP[$h]// /}" ]; then
+      JOB[error]=confirm_new_node_db_restart; JOB[message]="$h: also restart (staying single): ${N_OTHERS_UP[$h]}"; finish fail
+    fi
+  done
+fi
+
 failed_at=-1
 for i in "${!S_ID[@]}"; do
-  case ${S_ID[$i]} in precheck|node_check) continue ;; esac
+  case ${S_ID[$i]} in precheck|node_check|preflight) continue ;; esac
   if [ "$CANCEL" = 1 ]; then FAIL_CODE=cancelled; FAIL_MSG="cancelled before ${S_ID[$i]}"; failed_at=$i; break; fi
   step_set "$i" running
   JOB[step_no]=$((i + 1)); job_write
