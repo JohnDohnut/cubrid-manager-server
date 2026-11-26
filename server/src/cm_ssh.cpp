@@ -1010,37 +1010,35 @@ namespace
     bool aborted = false;
     for (;;)
       {
-	/* client -> channel */
-	if (!stdin_done || fr.closed == false)
-	  {
-	    struct pollfd p = { cfd, POLLIN, 0 };
-	    if (poll (&p, 1, 0) > 0)
-	      {
-		if (!fr.fill (cfd) || (fr.closed && !stdin_done))
-		  {
-		    aborted = true;
-		    break;
-		  }
-		char t;
-		string d;
-		while (fr.next (&t, &d))
-		  {
-		    if (t == 'I')
-		      {
-			pending += d;
-		      }
-		    else if (t == 'E')
-		      {
-			stdin_done = true;
-		      }
-		  }
-		if (fr.closed)
-		  {
-		    aborted = true;
-		    break;
-		  }
-	      }
-	  }
+	/* client -> channel. Frames may already sit in the buffer: the first read, done for the request,
+	   can take the whole stdin and its end with it, so the buffer is drained before waiting for more. */
+	{
+	  struct pollfd p = { cfd, POLLIN, 0 };
+	  if (poll (&p, 1, 0) > 0 && !fr.fill (cfd))
+	    {
+	      aborted = true;
+	      break;
+	    }
+	  char t;
+	  string d;
+	  while (fr.next (&t, &d))
+	    {
+	      if (t == 'I')
+		{
+		  pending += d;
+		}
+	      else if (t == 'E')
+		{
+		  stdin_done = true;
+		}
+	    }
+	  if (fr.closed)
+	    {
+	      /* the client went away (killed or stopped waiting) */
+	      aborted = true;
+	      break;
+	    }
+	}
 	while (!pending.empty ())
 	  {
 	    ssize_t w = libssh2_channel_write (ch, pending.data (), pending.size ());

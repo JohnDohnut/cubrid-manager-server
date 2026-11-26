@@ -313,15 +313,36 @@ namespace
     return false;
   }
 
-  /* reserve the lock for a new job; the script turns it into "running" when it starts */
-  bool lock_reserve (const string &uuid, string *holder)
+  bool mkdir_p (const string &path)
+  {
+    string cur;
+    for (const string &part : split (path, '/'))
+      {
+	if (part.empty ())
+	  {
+	    continue;
+	  }
+	cur += "/" + part;
+	if (mkdir (cur.c_str (), 0755) != 0 && errno != EEXIST)
+	  {
+	    return false;
+	  }
+      }
+    return true;
+  }
+
+  /*
+   * reserve the lock for a new job; the script turns it into "running" when it starts.
+   * 0: reserved, 1: another job holds it (*holder), -1: the lock file cannot be used (*holder)
+   */
+  int lock_reserve (const string &uuid, string *holder)
   {
     string path = jobs_root () + "/lock";
-    int fd = open (path.c_str (), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    int fd = (mkdir_p (jobs_root ())) ? open (path.c_str (), O_RDWR | O_CREAT | O_CLOEXEC, 0600) : -1;
     if (fd < 0)
       {
-	*holder = "cannot open " + path;
-	return false;
+	*holder = "cannot open " + path + ": " + strerror (errno);
+	return -1;
       }
     flock (fd, LOCK_EX);
     string content;
@@ -339,7 +360,7 @@ namespace
       }
     flock (fd, LOCK_UN);
     close (fd);
-    return ok;
+    return ok ? 0 : 1;
   }
 
   void lock_release_if (const string &uuid)
@@ -948,9 +969,10 @@ ext_ha_add_nodes (Json::Value &request, Json::Value &response)
 	}
     }
 
-  if (!lock_reserve (uuid, &why))
+  int lr = lock_reserve (uuid, &why);
+  if (lr != 0)
     {
-      return give_up ("another job is running: " + why);
+      return give_up (lr > 0 ? "another job is running: " + why : why);
     }
   if (action == "plan" || action == "run")
     {
