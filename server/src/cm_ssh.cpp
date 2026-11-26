@@ -1455,11 +1455,13 @@ namespace
 	  {
 	    continue;
 	  }
-	int cfd = accept4 (ls, NULL, NULL, SOCK_CLOEXEC);
+	/* accept + FD_CLOEXEC rather than accept4, which needs glibc 2.10 (the helper is built for glibc 2.7 and up) */
+	int cfd = accept (ls, NULL, NULL);
 	if (cfd < 0)
 	  {
 	    continue;
 	  }
+	fcntl (cfd, F_SETFD, FD_CLOEXEC);
 	std::thread (handle_client, cfd).detach ();
       }
     ::close (ls);

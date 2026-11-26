@@ -121,7 +121,8 @@ if(CMS_STANDALONE)
       PREFIX               ${CMS_3RDPARTY_DIR}/openssl
       LOG_CONFIGURE TRUE LOG_BUILD TRUE LOG_INSTALL TRUE
       TIMEOUT 1800 INACTIVITY_TIMEOUT 60 DOWNLOAD_NO_PROGRESS 1
-      CONFIGURE_COMMAND    <SOURCE_DIR>/config --prefix=${CMS_3RDPARTY_DIR} --libdir=lib no-shared no-module no-tests no-docs
+      # OPENSSLDIR points where no customer machine has an openssl.cnf, so nothing is read from the system
+      CONFIGURE_COMMAND    <SOURCE_DIR>/config --prefix=${CMS_3RDPARTY_DIR} --libdir=lib --openssldir=/nonexistent/cubrid-cm-ssh no-shared no-module no-tests no-docs
       BUILD_COMMAND        make -j4 build_sw
       # a plain make under the parent "make -j" fails with "write jobserver: Bad file descriptor"
       INSTALL_COMMAND      ${CMAKE_COMMAND} -E env MAKEFLAGS= MFLAGS= make install_sw
@@ -304,7 +305,8 @@ add_executable(cm_ssh ${CMS_SRC_DIR}/cm_ssh.cpp)
 target_compile_definitions(cm_ssh PRIVATE _GNU_SOURCE _FILE_OFFSET_BITS=64)
 target_compile_options(cm_ssh PRIVATE ${CMS_WARN_FLAGS})
 target_include_directories(cm_ssh BEFORE PRIVATE ${CMS_LIBSSH2_INCLUDES} ${CMS_OPENSSL_INCLUDES})
-target_link_libraries(cm_ssh PRIVATE ${CMS_LIBSSH2_LIBS} ${CMS_OPENSSL_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+# rt: clock_gettime lives in librt on glibc older than 2.17 (the official build image has 2.12)
+target_link_libraries(cm_ssh PRIVATE ${CMS_LIBSSH2_LIBS} ${CMS_OPENSSL_LIBS} Threads::Threads ${CMAKE_DL_LIBS} rt)
 target_link_options(cm_ssh PRIVATE "-Wl,--exclude-libs,libssl.a:libcrypto.a:libssh2.a")
 add_dependencies(cm_ssh cms_libssh2)
 
