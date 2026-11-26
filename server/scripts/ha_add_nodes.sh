@@ -14,7 +14,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 #
-# ha_add_nodes.sh - turn a single database server into an HA master and/or add slaves and replicas to an HA group.
+# ha_add_nodes.sh - promote a single database server to an HA master and/or add slaves and replicas to an HA group.
 #
 #   ha_add_nodes.sh <plan|run|rollback|cleanup> --job-dir <dir> [--agent <socket>] [options]
 #     --master-host <name>            this server's HA node name (default: uname -n)
@@ -27,7 +27,7 @@
 #     --backup-path <path>            backup folder on this server (default: $CUBRID_DATABASES/ha_add_nodes_backup)
 #     --remote-backup-path <path>     folder for the received backup on new nodes (same default there)
 #     --ha-group <name> --ha-port-id <port>   (single server) HA group name (default cubrid) and port (59901)
-#     --rollback-convert              on failure after the conversion, go back to a single server as well
+#     --rollback-convert              on failure after the promotion, go back to a single server as well
 #     --no-start-ha                   prepare the new nodes but do not start HA on them
 #     --keep <host>:<path>            (cleanup) an old database folder a successful job kept aside; repeat
 #
@@ -797,14 +797,14 @@ final_sync() {   # one value per ha_node_list node: the new slaves take the last
   printf '%s' "$s"
 }
 
-# ------------------------------------------------ B: conversion (single server)
+# ------------------------------------------------ B: promotion to HA master (single server only)
 
 st_convert_stop() {
   local no=$1
   JOB[down_at]=$(epoch); job_write
   undo_add "$no" "$L" server_start "${UP_BEFORE[@]}"
   [ ${#UP_BEFORE[@]} -eq 0 ] && return 0
-  log "service interruption starts: ${UP_BEFORE[*]} stop"
+  log "promotion to HA master: service interruption starts, ${UP_BEFORE[*]} stop"
   on_node "$L" 600 0 server_stop "${UP_BEFORE[@]}" || { fail command_failed "cubrid server stop failed: $(one_line "$OUT")"; return 1; }
 }
 
@@ -1081,11 +1081,11 @@ build_steps() {
   for i in "${!EX_HOST[@]}"; do step_add node_check "Check an existing node" "${EX_HOST[$i]}" ""; done
   for h in "${NEW_HOST[@]}"; do step_add node_check "Check a new node" "$h" ""; done
   if [ "$LOCAL_STATE" = single ]; then
-    step_add convert_stop "Stop the running databases (service stops)" "$L" ""
-    step_add convert_config "Write the HA settings" "$L" ""
-    step_add convert_restart "Start the HA databases under heartbeat" "$L" ""
-    step_add convert_verify "Check that the HA databases are the active master (service resumes)" "$L" ""
-    step_add convert_start_others "Start the other databases again without HA" "$L" ""
+    step_add convert_stop "Promote to HA master: stop the running databases (service stops)" "$L" ""
+    step_add convert_config "Promote to HA master: write the HA settings" "$L" ""
+    step_add convert_restart "Promote to HA master: start the HA databases under heartbeat" "$L" ""
+    step_add convert_verify "Promote to HA master: check that they are the active master (service resumes)" "$L" ""
+    step_add convert_start_others "Promote to HA master: start the other databases again without HA" "$L" ""
   fi
   for h in "${NEW_HOST[@]}"; do step_add new_config "Write the new node's HA settings" "$h" ""; done
   for db in "${D[@]}"; do
@@ -1168,7 +1168,7 @@ undo_one() {   # undo_one <host> <kind> [args...] ; 0 when it is back
   esac
 }
 
-# the convert steps (single server) are undone only with --rollback-convert, unless the conversion itself failed
+# the promotion steps (convert_*) are undone only with --rollback-convert, unless the promotion itself failed
 CONVERT_LAST=0
 rollback_all() {
   IN_ROLLBACK=1
