@@ -172,6 +172,28 @@
 | `.bak` 사본이 없어짐 | "되돌릴 것 없음"으로 기록 | `fail` 또는 `rollback_failed` | 파일 내용 확인 |
 | 되돌리기 중 L 다운 | 스크립트가 사라짐 | `interrupted` | 다시 `rollback`(끝난 줄은 건너뜀) |
 
+### 2.15 ssh 원인별 오류 (v5 변경안, 설계 부록 3.5)
+
+뭉뚱그린 "연결 실패"를 쓰지 않음. 모두 노드 이름·원인·사용자 할 일 한 줄을 상태와 `plan` 결과에 넣음. 작업 전(C3·S1·S2)에 걸리는 것은 바꾼 것이 없으므로 끝 상태가 `fail`임.
+
+| 코드 | 원인 | 단계 | 끝 상태 | 사용자 할 일 |
+|---|---|---|---|---|
+| `local_ssh_missing` | L에 `ssh`·`ssh-keyscan`·`ssh-keygen`·`setsid` 중 없는 것(이름을 밝힘) | C3 | `fail` | openssh-clients 설치 |
+| `name_unresolved` | 노드 이름을 풀 수 없음 | C3 | `fail` | /etc/hosts·DNS |
+| `port_refused` | ssh 포트 연결 거부 | C3 | `fail` | sshd 실행·포트 확인 |
+| `port_timeout` | ssh 포트 연결 시간 초과 | C3 | `fail` | 방화벽·망 확인 |
+| `hostkey_mismatch` | 호스트 키가 확인한 지문과 다름 | C3 | `fail` | 키가 바뀐 이유 확인 후 지문 다시 확인 |
+| `no_password_auth` | sshd가 password·keyboard-interactive를 모두 막음 | C3 | `fail` | sshd 설정에서 둘 중 하나 허용 |
+| `auth_failed` | 비밀번호 틀림(다시 시도하지 않음) | C3 | `fail` | 계정·비밀번호 확인, 잠김이면 해제 요청 |
+| `remote_shell_failed` | 원격에서 셸을 실행할 수 없음 | S2 | `fail` | 계정의 로그인 셸 확인 |
+| `cubrid_not_found` | 그 계정에 CUBRID 환경이 없음 | S2 | `fail` | CUBRID 설치 계정으로 다시 입력 |
+| `node_script_missing` / `node_script_version_mismatch` / `node_script_tampered` / `node_script_unsafe` | 노드 스크립트가 없음 / 버전이 다름 / 해시가 다름 / 권한이 느슨함 | S2 | `fail` | 같은 패키지로 맞춤·파일 복구·권한 복구 |
+| `version_mismatch` | CUBRID 전체 버전이 다름(노드 이름과 양쪽 버전) | S2 | `fail` | 같은 버전으로 맞춤 |
+| `controlpath_too_long` | 제어 소켓 경로가 너무 김 | C3 | `fail` | `$CUBRID` 경로 확인 |
+| `connection_lost` | 작업 중 그 노드의 연결이 끝남 | S4~S21 | 2.1대로 `fail`·`rollback_failed` | 노드가 살아나면 비밀번호를 다시 넣고 `rollback` |
+| `no_answer` | 작업 중 바로 끝나는 명령이 답하지 않음 | S4~S21 | 2.1대로 | 같음 |
+| `no_response` | 작업 중 오래 걸리는 명령이 끝나지 않음 | S9~S18 | `rollback_blocked` | 노드에서 명령이 끝났는지 확인 후 `rollback`(R3) |
+
 ## 3. 수동 복구 절차
 
 - R1 승격 중 L이 죽음: L이 살아나면 `rollback`. `rollback`을 쓸 수 없으면 (1) `cubrid heartbeat stop`, `cub_commdb -A` (2) `$CUBRID/conf/cubrid.conf.bak.<uuid>.<순번>`, `cubrid_ha.conf.bak…`, `databases.txt.bak…`을 제 이름으로 돌림(`.new.…`만 있으면 그 파일은 작업이 만든 것이므로 지움) (3) 처음에 떠 있던 DB를 `cubrid server start`.

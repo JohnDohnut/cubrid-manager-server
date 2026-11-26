@@ -471,7 +471,7 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 
 ## 11. 사전 조건과 거절
 
-- 모든 노드의 CUBRID 버전이 같아야 함.
+- 모든 노드의 CUBRID 전체 버전(예: 11.4.5.1908)이 같아야 함(결정). 다르면 S2에서 `version_mismatch`로 거절하고, 문구에 노드 이름과 양쪽 버전을 넣음. 패치 번호만 다른 노드를 허용하는 선택지는 없음.
 - 모든 노드에서 모든 노드 이름이 풀려야 함. HA 노드 이름은 각 서버의 `uname -n`과 같아야 함.
 - 기존 노드 입력은 M 설정의 두 목록과 같아야 함(2.2).
 - 새 노드: D가 떠 있으면 안 됨. 다른 DB가 떠 있으면 `confirm_new_node_db_restart`가 있어야 함(2.6). 노드 기준 경로(2.5)에 쓸 수 있어야 하고, 받는 폴더에 백업 크기만큼 여유가 있어야 함(S3).
@@ -510,7 +510,8 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 - 전송은 새 노드마다 차례로 함(병렬 전송·새 노드 사이 중계는 하지 않음).
 - 같은 설정 파일을 다른 도구가 동시에 고치는 경우의 충돌 방지는 없음.
 - 윈도우는 대상이 아님.
-- 헬퍼에 넣는 OpenSSL은 FIPS 인증 모듈이 아님.
+- 대상 OS는 제조사 지원이 끝나지 않은 리눅스뿐임(CentOS 7 같은 지원 종료 OS는 고려하지 않음). 정확한 목록은 실측 문서 맨 위를 따름. 가장 낮은 OpenSSH는 RHEL 8 계열 8.0임.
+- 헬퍼에 넣는 OpenSSL은 FIPS 인증 모듈이 아님(부록 3의 OpenSSH 방식이면 OS 모듈을 쓰므로 없어짐).
 
 ## 부록. 근거
 
@@ -548,3 +549,225 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 | S19 | S19 | `verify` | 새 노드 확인만 |
 | 없음 | S20 | `verify_existing` | 기존 노드 확인을 따로 뗌(v3에서는 S19 안) |
 | S20 | S21 | `cleanup` | 번호만 바뀜 |
+
+## 부록 3. v5 변경안 (검토 중, 코드는 아직 v4)
+
+v4와 달라지는 네 가지를 한데 정리함. (1) 원격 접속을 번들 헬퍼(`cm_ssh`: libssh2 + OpenSSL) 대신 L에 깔린 OpenSSH 클라이언트로 함 (2) 원격 작업을 "스크립트를 임시 파일로 보내 실행"에서 "패키지에 설치된 노드용 스크립트 실행"으로 바꿈 (3) 스크립트 위조 확인(sha256) (4) ssh 원인별 오류. 아래 "결정"은 이미 정한 것이고, 나머지는 제안임.
+
+### 3.0 결정과 범위
+
+| 항목 | 내용 |
+|---|---|
+| 대상 OS | 제조사 지원이 끝나지 않은 OS만 대상으로 함(정확한 목록은 실측 문서 맨 위). CentOS 7 같은 지원 종료 OS는 고려하지 않음. 그래서 가장 낮은 OpenSSH는 RHEL 8 계열의 8.0임 |
+| CUBRID 버전 | 모든 노드의 전체 버전(예: 11.4.5.1908)이 같아야 함. 다르면 S2에서 거절하고 문구에 노드 이름과 양쪽 버전을 넣음(지금 구현: `version_mismatch` "<노드>: CUBRID <그 노드 버전>, this server <L 버전>"). 패치 번호만 다른 노드를 허용하는 선택지는 두지 않고, 버전이 섞인 상황을 위한 처리도 넣지 않음 |
+| ssh 오류 | 뭉뚱그린 "연결 실패"를 쓰지 않음. 원인마다 오류 코드·문구·사용자 할 일을 따로 두고, `plan`(C3·S1·S2)에서 거름(3.5) |
+
+CentOS 7 호환 때문에 넣은 우회(표시만 함, OpenSSH 방식이면 헬퍼와 함께 모두 없어짐)
+
+| 우회 | 위치 | 이유였던 것 |
+|---|---|---|
+| 헬퍼를 공식 빌드 이미지(CentOS 6, glibc 2.12)에서 빌드하고 요구 GLIBC를 2.7 이하로 맞춤 | 빌드 | CentOS 7(glibc 2.17)에서 실행 |
+| `accept4` 대신 `accept` + `fcntl(FD_CLOEXEC)` | `cm_ssh.cpp` | `accept4`가 GLIBC_2.10을 요구 |
+| `-lrt` 링크 | `CMakeLists.txt` | glibc 2.17 미만의 `clock_gettime` |
+| libssh2 `CMAKE_INSTALL_LIBDIR=lib` | `CMakeLists.txt` | CentOS 계열 빌드 이미지가 lib64에 설치 |
+
+- 스크립트 쪽에는 CentOS 7만을 위한 우회가 없음(`timeout`, `flock`, `chmod --reference`, `mktemp`는 대상 OS 모두에 있음).
+
+### 3.1 OpenSSH 방식 — 비밀번호 경로
+
+OpenSSH의 `ssh`는 비밀번호를 명령줄·표준 입력으로 받지 않음. 터미널이 없으면 `SSH_ASKPASS` 프로그램을 실행해 그 출력으로 받음.
+
+- 8.4 이상: `SSH_ASKPASS_REQUIRE=force`면 터미널이 있어도 askpass를 씀
+- 8.0~8.3(RHEL 8 계열 8.0): `DISPLAY`가 있고 제어 터미널이 없을 때만 씀. 그래서 `DISPLAY=x`(아무 값)를 주고 `setsid`로 제어 터미널을 떼고 실행함
+- 두 가지를 같이 줌(8.4 이상은 앞의 것, 8.0~8.3은 뒤의 것으로 동작)
+
+askpass까지 비밀번호를 넘기는 방법
+
+| 방법 | `ps`·`/proc` 노출 | CMS↔스크립트 의존 | 계정 잠김 방지 | 판단 |
+|---|---|---|---|---|
+| (a) 환경 변수(askpass가 `$X`를 출력) | `ps`에는 없음. 같은 계정은 `/proc/<pid>/environ`으로 읽음. 그 ssh가 ControlMaster로 작업 내내 살아 있으므로 작업 시간 내내 노출 | 없음 | 노드당 한 번 | 쓰지 않음 |
+| (b) 작업 폴더(700) 안 FIFO. CMS가 노드마다 한 번 쓰고 바로 지움 | 없음. 파일에 남지 않음(FIFO는 내용을 저장하지 않음). 같은 계정 프로세스가 먼저 열어 가로챌 틈이 있으나, 같은 계정은 이미 CMS 권한을 다 가짐(4.2의 남는 위험과 같음) | C3에서 CMS가 각 노드의 첫 로그인이 끝날 때까지 기다림(지금의 `READY` 기다림과 같은 자리 하나) | 노드당 로그인 한 번(아래 ControlMaster) | **채택** |
+| (c) fd로 넘김 | 없음 | — | — | 쓰지 못함: `ssh`가 시작할 때 3 이상의 fd를 닫음[확인 필요: OpenSSH 소스] |
+| (c') 0600 임시 파일을 askpass가 읽고 지움 | 같은 계정만. 디스크에 잠깐 남고, 죽으면 남을 수 있음 | (b)와 같음 | 같음 | (b)보다 못함 |
+| (c'') sshpass·expect | sshpass는 `-p`(명령줄)·`-e`(환경 변수) 방식이고 대상 OS 기본 설치가 아님 | — | — | 쓰지 않음 |
+
+채택한 흐름(노드마다, C3에서 CMS가 함)
+
+1. `ssh-keyscan`으로 호스트 키를 받아 화면이 확인한 지문과 비교함. 같은 키 하나만 작업 전용 `known_hosts`에 씀. 그 키 종류만 쓰도록 `HostKeyAlgorithms`를 고정함(OpenSSH 판마다 먼저 고르는 키 종류가 다를 수 있음[실측 항목])
+2. 인증 방법 확인: 인증을 하지 않는 접속(`BatchMode=yes`)으로 서버가 허용하는 방법 목록을 읽음. password가 있으면 password만, 없고 keyboard-interactive가 있으면 그것만 쓰도록 `PreferredAuthentications`를 하나로 정하고 `NumberOfPasswordPrompts=1`. 둘 다 없으면 `no_password_auth`로 거절
+3. FIFO(이름은 임의, 0600)를 만들고 `setsid ssh -M -N -f -S <ControlPath> …`를 `SSH_ASKPASS=<노드용 askpass>`, `SSH_ASKPASS_REQUIRE=force`, `DISPLAY=x`로 띄움. askpass는 FIFO를 읽어 출력하는 짧은 셸 스크립트(패키지에 설치)
+4. CMS가 FIFO에 비밀번호를 한 번 쓰고 닫은 뒤 FIFO를 지움. 메모리의 비밀번호도 지움
+5. `ssh -O check -S <ControlPath>`로 로그인이 됐는지 확인. 실패면 원인을 가려(3.5) 그 노드는 다시 시도하지 않음
+
+- "스크립트는 비밀번호를 모름"은 그대로 지켜짐. 스크립트는 ControlPath만 받아 `ssh -S <ControlPath> -o ControlMaster=no <노드> …`로 씀. 비밀번호가 지나가는 곳은 CMS 메모리 → FIFO → askpass 출력 → ssh뿐임
+- 달라지는 점: 지금 헬퍼는 비밀번호를 들고 있다가 끊기면 한 번 다시 로그인함. OpenSSH 방식은 ControlMaster가 죽으면 그 노드에 다시 로그인할 수 없음(비밀번호가 남아 있지 않음) → 그 노드는 `connection_lost`. 되돌리기는 사용자가 비밀번호를 다시 넣고 `rollback`(C3를 다시 함). 계정 잠김 쪽으로는 로그인 시도가 더 적어 유리함
+
+### 3.2 `cm_ssh` 하위 명령을 OpenSSH로
+
+| 지금 | OpenSSH 방식 | 비고 |
+|---|---|---|
+| `hostkey <호스트> <포트>` | `ssh-keyscan -T 10 -p <포트> <호스트>` → `ssh-keygen -lf <파일>`로 SHA256 지문 | 인증 없음. `ha_check_ssh` 첫 호출 |
+| `check` | 3.1의 1~5를 일회용 ControlPath로 하고 `uname -n`, CUBRID 경로·버전, 노드 스크립트 버전·sha256을 읽은 뒤 `-O exit` | 로그인 시도 한 번 |
+| `agent`(비밀번호 들고 대기) | C3에서 노드마다 ControlMaster(`-M -N -f`, `ControlPersist=900`: 마지막 사용 뒤 15분이면 스스로 끝남) | 비밀번호는 로그인에만 쓰고 남기지 않음 |
+| `bind <pid>`(스크립트가 죽으면 헬퍼도 끝) | 대응 없음. 스크립트가 끝날 때 `-O exit`, 스크립트가 죽으면 ControlPersist 시간 뒤 끝남. CMS가 상태 조회에서 `interrupted`를 보거나 `rollback`·`cleanup`을 받으면 남은 것에 `-O exit` | 죽은 뒤 최대 15분 동안 같은 계정이 소켓으로 그 노드에 명령할 수 있음(4.2 남는 위험과 같은 성격) |
+| `exec` | `ssh -S <cp> -o ControlMaster=no -T <노드> <노드 스크립트 경로> <하위 명령> <인자>` | 원격 셸이 명령 문자열을 해석하므로 인자는 지금처럼 모두 따옴표 처리. csh·tcsh 계정도 경로 + 인자만이라 문법 차이 없음 |
+| `exec --stdin` | 같은 명령에 표준 입력을 넘김 | |
+| `exec --daemon` | 쓰지 않음(노드 스크립트가 데몬을 `setsid … </dev/null >파일 2>&1`로 띄움. 지금도 같음) | |
+| `put`(SFTP, 이어 올리기, 원격 sha256) | 노드 스크립트 `recv <경로> <크기> <sha256>`에 `ssh … <` 로 흘려 보냄. 끊기면 `recv --size`로 받은 크기를 묻고 `tail -c +<크기+1> | ssh … recv --append`로 이어 보냄(최대 3번). 끝에 노드 스크립트가 크기·sha256을 비교 | scp는 OpenSSH 9.0부터 SFTP를 쓰므로 SFTP를 막은 서버에서 안 됨. `cat` 흐름은 SFTP 하위 시스템이 필요 없음 |
+| `quit` | `ssh -S <cp> -O exit <노드>` | |
+| 취소 중 원격 명령 | 지금과 같음: 로컬 `ssh` 클라이언트만 끝냄. 원격 명령은 채널이 닫혀도 계속 돌 수 있으므로 9.3의 "끝난 뒤" 규칙과 rollback_blocked 판단을 그대로 씀 | |
+| 응답 없는 노드 | ControlMaster에 `ServerAliveInterval=15`, `ServerAliveCountMax=4` → 약 60초 무응답이면 마스터가 끝남 → 그 뒤 명령은 바로 종료 코드 255(`connection_lost`). 지금의 제한 시간 판단(2.1·2.6)은 그대로 둠 | 망이 패킷을 버리는 끊김도 60초 안에 드러남 |
+| ControlPath 길이 | 유닉스 소켓 경로는 108바이트(리눅스)까지. `ssh`가 만들 때 임시 이름(약 17자)을 붙임. 작업 폴더 아래 대신 짧은 경로 `$CUBRID/tmp/hs<작업 번호 앞 8자>/%C`(`%C`는 40자 해시)를 씀. C3가 길이를 계산해 넘으면 `controlpath_too_long`으로 거절 | `$CUBRID`가 아주 길 때만 걸림 |
+| 정리 | 끝(`finish`)에서 노드마다 `-O exit`, 짧은 경로 폴더 삭제 | |
+
+### 3.3 없어지는 것, 새로 생기는 것
+
+| 없어지는 것 | 새로 생기는 것 |
+|---|---|
+| `cm_ssh`(약 1,700줄), CMakeLists의 libssh2 ExternalProject와 정적 OpenSSL 빌드, `--exclude-libs` 링크 순서 | L에 `ssh`, `ssh-keyscan`, `ssh-keygen`, `setsid`가 있어야 함. C3·`ha_check_ssh`가 확인하고 없으면 무엇이 없는지 밝혀 거절(`local_ssh_missing`) |
+| `libssh2_license.txt` 고지 | OpenSSH 판 차이(8.0~9.x): askpass 조건, 먼저 고르는 호스트 키 종류, scp 동작. 실측으로 맞춤 |
+| CentOS 6 빌드 이미지·GLIBC 제약(3.0 표) | 노드 스크립트·askpass 설치(3.4) |
+| "번들 OpenSSL은 FIPS 인증 모듈이 아님" 한계 | FIPS: OS의 OpenSSH와 OS 암호 모듈을 쓰므로, FIPS 모드 OS에서는 그 OS가 인증받은 모듈로 동작함(13절 한계가 사라짐) |
+| 헬퍼의 비밀번호 메모리 보호(mlock, 덤프 금지) | 비밀번호가 CMS 밖에 오래 남지 않으므로 필요 없음(로그인 뒤 버림) |
+
+### 3.4 노드용 스크립트(`node.sh`) 설치형
+
+구조
+
+- CMS 패키지에 노드용 스크립트를 넣음. 경로는 지금 배치 관례(`$CUBRID/share/cms/ha_add_nodes.sh`)에 맞춰 `$CUBRID/share/cms/ha_node.sh`, askpass는 `$CUBRID/share/cms/ha_askpass.sh`
+- L의 스크립트는 `ssh <노드> '<그 노드의 $CUBRID>/share/cms/ha_node.sh <하위 명령> <인자>'`만 부름. 인자는 호스트·DB 이름·경로·숫자뿐이고 비밀번호는 없음
+- L 자신의 노드 동작도 같은 `ha_node.sh`를 바로 부름(로컬·원격 같은 코드는 그대로 유지)
+- 지금 `ha_add_nodes.sh` 안의 "노드 동작" 부분(`node_*` 함수)을 그대로 떼어 냄. `ha_add_nodes.sh`는 흐름만 남음
+
+하위 명령(지금 노드 동작에서 옮김)
+
+| 단계 | 하위 명령 |
+|---|---|
+| 모든 호출 전(S2) | `version`(스크립트 버전 + CUBRID 전체 버전 + 자기 sha256), `info`(호스트 이름, 로그인 셸, `$CUBRID`, `$CUBRID_DATABASES`, HA 설정, 떠 있는 서버, databases.txt) |
+| S2·S3 확인 | `resolve <이름>...`, `free <경로>`, `writable <경로>...`, `mode <DB>...`, `exists <경로>...` |
+| S10 받기 | `mkdir <경로>`, `recv <경로> <크기> <sha256> [--append]`, `recv --size <경로>` |
+| S11 설정 | `conf_edit <파일> <표시> <절> <키> <값>...`, `dbtxt_put …`, `mkdir` |
+| S12 보관 | `keep_old <표시> <DB> <볼륨> <로그> <복제 로그 위치>` |
+| S13 복원 | `restore <DB> <백업 폴더> <로그 경로> <마스터> <원본 상태>` |
+| S14 첫 복사 | `first_copylog <DB> <마스터> <폴더>` |
+| S15·S16 HA 시작 | `server_stop`, `master_down`, `ha_start`, `server_start`, `hb_status`, `repl start <노드>` |
+| S17·S18 기존 노드 | `conf_edit`, `dbtxt_add_hosts`, `reload`, `repl start|stop <노드>`, `exists` |
+| S19·S20 확인 | `mode`, `hb_status` |
+| S21 정리 | `remove <경로>`, `rmdir_empty <경로>`, `drop_backups <표시> <경로>...` |
+| 되돌리기 | `undo_file`, `move_back`, `clear`, `remove`, `rmdir_empty`, `server_ensure`, `server_stop`, `ha_stop`, `master_start`, `reload`, `repl stop` |
+
+- 지금의 범용 `cubrid <인자...>` 통로는 없앰(L의 backupdb만 씀 → L 쪽 `backup <DB> <폴더>` 하위 명령으로). 원격에서 아무 명령이나 돌릴 길을 남기지 않기 위함임
+- 경로 인자는 지금처럼 `valid_path`로 검사하고, 지우는 하위 명령(`remove`, `clear`)은 작업 표시(`.ha_add_nodes_`·작업 uuid)가 들어간 경로나 작업이 기록한 경로만 받음
+
+버전·위조 확인(S2, 3.6과 같이)
+
+- `ha_node.sh version`이 스크립트 버전과 CUBRID 전체 버전을 알려 줌. L과 다르면 `node_script_version_mismatch`, 파일이 없으면(원격 종료 코드 127 또는 "No such file") `node_script_missing`. CUBRID 버전이 다르면 지금처럼 `version_mismatch`
+
+확인한 것
+
+| 질문 | 답 | 근거 |
+|---|---|---|
+| CUBRID 배포판에 CMS가 늘 같이 들어가는지 | 공식 빌드는 늘 들어감. 엔진 저장소가 CMS를 하위 모듈(`cubridmanager`)로 두고 `WITH_CMSERVER` 기본값이 ON이며, tarball·shell·rpm이 같은 설치 규칙을 씀. 하위 모듈이 없을 때만 빠짐(소스에서 직접 빌드하는 경우) | 엔진 `CMakeLists.txt`(`option(WITH_CMSERVER … ON)`, `add_subdirectory(cubridmanager/server)`), `build.sh`(`without_cmserver`), `.gitmodules` |
+| 그래서 노드 스크립트를 엔진·CMS 중 어디에 둘지 | CMS 쪽. 노드 스크립트는 CMS가 떠 있을 필요가 없고 파일만 있으면 됨. CMS를 빼고 빌드한 노드는 `node_script_missing`으로 분명히 거절됨 | 위 |
+| 비로그인 ssh에서 `$CUBRID` 찾기 | 지금 구현을 그대로 씀. 첫 접속(S2)에서 로그인 셸로 `$CUBRID`를 읽어(bash·sh는 `bash -l`, csh·tcsh는 그 셸로 값을 읽음: 지금의 `node_env_bootstrap`) 그 노드의 스크립트 경로를 정함. `ha_node.sh`는 시작할 때 자기 위치에서 `$CUBRID`를 정하고, `$CUBRID_DATABASES`·`LD_LIBRARY_PATH`는 같은 방법으로 로그인 환경에서 읽음 | `ha_add_nodes.sh`의 `node_env_bootstrap`, `on_node` |
+| 지금 원격 임시 파일을 어떻게 실행하는지 | `f=$(mktemp) && cat >"$f" && bash -l "$f" node …`: 파일을 실행 파일로 띄우지 않고 `bash`가 읽음. 그래서 /tmp가 noexec여도 영향 없음. 설치형으로 바뀌면 임시 파일 자체가 없어짐 | `on_node` |
+
+보안상 나아지는 점
+
+- 원격에 코드를 쓰고 실행하는 일이 없음(임시 파일 생성·실행 없음)
+- 실행되는 것이 패키지가 설치한 고정 경로 파일이라, 고객이 sshd `ForceCommand`나 `authorized_keys`의 `command=`, sudo 규칙 같은 허용 목록에 넣을 수 있음
+- 받은 코드를 쓴 뒤 실행하기 전에 바꿔치기될 틈(임시 파일)이 없음. 남는 틈은 설치 파일 자체이고 3.6이 권한·해시로 줄임
+
+패키징·설치 변경
+
+- `server/scripts/ha_node.sh`, `ha_askpass.sh`를 더하고 `install(PROGRAMS … DESTINATION ${CMS_SHAREDIR}/cms)`에 넣음
+- 빌드 때 두 스크립트의 sha256을 계산해 헤더를 만들고 cub_manager에 상수로 넣음(3.6)
+- `cm_ssh` 대상, libssh2·OpenSSL 빌드, 고지 설치를 뺌
+
+### 3.5 ssh 원인별 오류
+
+`plan`에서 거르는 것은 C3(CMS의 로그인)·S1·S2에서 나옴. 오류마다 `error`(코드), `message`(노드 이름 + 원인), `action`(사용자 할 일 한 줄)을 상태 응답과 `plan` 결과에 넣고, 노드별 결과는 `node_checks[]`(`node`, `code`, `message`, `action`)로 줌.
+
+| 코드 | 원인 | 알아내는 방법 | 단계 | 사용자 할 일 |
+|---|---|---|---|---|
+| `local_ssh_missing` | L에 OpenSSH 클라이언트가 없음. `detail`에 없는 것(`ssh`, `ssh-keyscan`, `ssh-keygen`, `setsid`) | 실행 파일 확인 | C3·`ha_check_ssh` | 이 서버에 openssh-clients(배포판 이름) 설치 |
+| `name_unresolved` | 노드 이름을 풀 수 없음 | `getent hosts` | C3 | /etc/hosts 또는 DNS에 노드 이름 등록 |
+| `port_refused` | ssh 포트 연결 거부 | `ssh-keyscan`·`ssh` 출력("Connection refused") | C3 | 그 노드의 sshd 실행 여부와 포트 번호 확인 |
+| `port_timeout` | ssh 포트 연결 시간 초과 | `ConnectTimeout=10` 초과("timed out") | C3 | 방화벽·망 경로 확인 |
+| `hostkey_mismatch` | 호스트 키가 화면에서 확인한 지문과 다름 | `ssh-keyscan` 지문 비교 | C3 | 그 노드의 키가 바뀐 이유 확인 후 지문을 다시 확인 |
+| `no_password_auth` | sshd가 password·keyboard-interactive를 모두 허용하지 않음 | 인증 없는 접속이 알려 주는 허용 목록 | C3 | 그 노드 sshd의 `PasswordAuthentication` 또는 `KbdInteractiveAuthentication` 허용 |
+| `auth_failed` | 비밀번호가 틀림(또는 계정 잠김). 다시 시도하지 않음 | 로그인 실패("Permission denied") | C3 | 계정·비밀번호 확인. 잠김(faillock)이면 관리자에게 해제 요청 |
+| `remote_shell_failed` | 원격에서 sh·bash를 실행할 수 없음(로그인 셸이 nologin 등) | 로그인 뒤 첫 명령의 종료 코드 126·127 또는 출력 없음 | S2 | 그 계정의 로그인 셸 확인 |
+| `cubrid_not_found` | 그 계정에 CUBRID 환경이 없음 | 로그인 환경의 `$CUBRID`가 비었거나 `cubrid_rel` 없음 | S2 | CUBRID를 설치한 계정으로 다시 입력 |
+| `node_script_missing` | 노드 스크립트가 없음 | 종료 코드 127 / 파일 없음 | S2 | 그 노드의 CUBRID 패키지(CMS 포함) 확인 |
+| `node_script_version_mismatch` | 노드 스크립트 버전이 L과 다름 | `ha_node.sh version` | S2 | 같은 CUBRID 패키지로 맞춤 |
+| `node_script_tampered` | 노드 스크립트 sha256이 L의 기준값과 다름(버전은 같음) | 3.6 | S2 | 패키지 파일로 되돌리고 바뀐 경위 확인 |
+| `node_script_unsafe` | 노드 스크립트나 그 폴더를 다른 사용자가 쓸 수 있음 | 3.6 | S2 | 소유자·권한을 설치 상태로 되돌림 |
+| `version_mismatch` | CUBRID 전체 버전이 다름 | `ha_node.sh version` | S2 | 모든 노드를 같은 버전으로 맞춤 |
+| `controlpath_too_long` | ControlPath가 소켓 경로 길이를 넘음 | 길이 계산 | C3 | `$CUBRID`가 짧은 경로가 되게 설치(드묾) |
+| `connection_lost` | 작업 도중 그 노드의 ControlMaster가 끝남(망 끊김, 재부팅) | 명령 종료 코드 255 + `-O check` 실패 | S4~S21 | 2.1대로 되돌림. 노드가 살아나면 비밀번호를 다시 넣고 `rollback` |
+| `no_answer` | 작업 도중 바로 끝나는 명령이 시간 안에 답하지 않음(지금과 같음) | 제한 시간 | S4~S21 | 같음 |
+| `no_response` | 오래 걸리는 명령이 시간 안에 끝나지 않음(지금과 같음, `rollback_blocked`) | 제한 시간 | S9~S18 | 그 명령이 끝났는지 노드에서 확인 후 `rollback`(R3) |
+
+- `unreachable`은 v5에서 `port_refused`·`port_timeout`·`name_unresolved`로 나뉘어 없어짐
+- 같은 표를 실패 목록표에 넣음(2.15)
+
+### 3.6 스크립트 위조 확인(sha256)
+
+기준 값
+
+- 빌드할 때 `ha_add_nodes.sh`, `ha_node.sh`, `ha_askpass.sh`의 sha256을 계산해 cub_manager에 상수로 넣음(CMake가 헤더를 생성)
+- 같은 서버의 파일(`SHA256SUMS` 등)에 두지 않음. 스크립트를 바꿀 수 있는 사람이 그 파일도 같이 바꿀 수 있기 때문임
+
+| 무엇을 | 어디서 | 언제 | 다르면 |
+|---|---|---|---|
+| `ha_add_nodes.sh`, `ha_askpass.sh`(L) | L의 CMS | C4 직전(스크립트를 띄우기 전), C3 직전(askpass) | `script_tampered`로 거절 |
+| 각 노드의 `ha_node.sh` | L의 스크립트가 `ssh`로 그 노드의 `sha256sum` 결과를 읽어 CMS가 넘긴 기준값과 비교 | S2 | `node_script_tampered`(버전이 다르면 `node_script_version_mismatch`) + 노드 이름 |
+| 각 노드의 `ha_askpass.sh` | 쓰지 않음(askpass는 L에서만 실행) | — | — |
+| 백업 파일 전송(S10) | 받는 노드의 `ha_node.sh recv`가 크기·sha256 비교(지금은 헬퍼가 원격 `sha256sum`으로 비교) | S10 끝 | `transfer_failed` |
+| 파일 권한 | L은 CMS, 노드는 S2 | 위와 같은 때 | 스크립트와 그 폴더(`share/cms`, `share`)가 설치 계정 소유가 아니거나 그룹·다른 사용자 쓰기가 있으면 `script_unsafe` / `node_script_unsafe` |
+
+- 기준값은 CMS가 스크립트 인자로 넘김(`--node-script-sha256 <값>`). 스크립트가 바뀌었으면 C4에서 이미 거절됐으므로 넘긴 값을 믿을 수 있음
+- `sha256sum`은 coreutils에 들어 있어 대상 OS 모두에 있음(OS 11개 실측에서 원격 `sha256sum` 비교가 모두 됨. 대상 목록이 확정되면 그 목록과 다시 맞춤)
+
+한계
+
+- cub_manager 바이너리까지 바꿀 수 있는 공격자는 막지 못함(서명이 아니라 바이너리에 넣은 해시라서). 그 수준은 패키지 서명이나 OS 파일 무결성 도구(AIDE, IMA 등)의 영역임
+- 확인과 실행 사이의 틈은 권한 확인으로 줄일 뿐 0이 아님(같은 계정이나 root는 그 사이에 바꿀 수 있음)
+- 원격 노드의 확인도 그 노드의 `sha256sum`과 셸을 믿는 것임
+
+### 3.7 바뀌는 설계 절·단계와 작업량
+
+| 절·단계 | 바뀌는 것 |
+|---|---|
+| 0·13 | 대상 OS 범위(지원 중인 OS, OpenSSH 8.0 이상). 13절 FIPS 한계 삭제 |
+| 1.1 | 구성 요소: `cm_ssh` → OpenSSH 클라이언트 + `ha_node.sh` + `ha_askpass.sh` |
+| 3.2 | CMS → 헬퍼 fd 3 대신 FIFO, 스크립트 인자에 ControlPath 목록과 노드 스크립트 기준 해시 |
+| 4 | 4.1 표에 3.1 비교 추가, 4.2 경로를 3.1 흐름으로 |
+| 5 | 전면 교체(헬퍼 → OpenSSH 사용 규칙, 3.2 표) |
+| 6.1 C3 | `cms_agent` → `cms_login`: 노드마다 키 확인·인증 방법 확인·ControlMaster 로그인, 노드별 결과(`node_checks[]`). C4 앞에 스크립트 해시·권한 확인 |
+| 6.2 S2 | 노드 스크립트 버전·해시·권한 확인 추가 |
+| 7 | P2(헬퍼 준비 → 로그인 완료), P5(헬퍼 종료 → `-O exit`·ControlPersist), P9(rollback은 C3 다시), P13(헬퍼 소켓 → ControlPath 이름을 실행마다 새로) |
+| 9.1 | 원격 실행 규칙: 임시 파일 대신 설치 경로 + 하위 명령 |
+| 10 | `ha_check_ssh` 내부, 오류 코드(3.5), `node_checks[]` |
+| 실패 목록표 | 2.1·2.3 코드 교체, 2.15 원인별 오류 표 |
+
+대략적인 작업량(1인 기준)
+
+| 일 | 양 |
+|---|---|
+| CMS C3 다시 쓰기(keyscan·인증 방법 확인·FIFO·ControlMaster·오류 코드), `ha_check_ssh` | 1.5일 |
+| `ha_node.sh` 분리(노드 동작 이동, `recv`·`version`·`backup`, 범용 통로 삭제), `ha_add_nodes.sh`의 `on_node`·전송 바꾸기 | 1.5일 |
+| sha256 상수 생성(CMake), 권한 확인, 설치 규칙, `cm_ssh`·libssh2·OpenSSL 빌드 삭제 | 0.5일 |
+| 시험: 2노드 회귀 + OS 실측 목록에서 OpenSSH 판별 확인(askpass 조건, 키 종류, 인증 방법 확인, ControlPersist, 이어 보내기) | 1.5일 |
+| 설계·실패 목록표 정리 | 0.5일 |
+| 합계 | 약 5.5일 |
+
+실측으로 확인할 것(OpenSSH 8.0~9.x)
+
+- askpass: 8.0에서 `DISPLAY=x` + `setsid`, 8.4 이상에서 `SSH_ASKPASS_REQUIRE=force`로 askpass가 불리는지. keyboard-interactive 질문에도 askpass가 쓰이는지
+- 인증 없는 접속이 허용 방법 목록을 내는지(판마다 출력 문구)
+- 판마다 먼저 고르는 호스트 키 종류, `HostKeyAlgorithms` 고정과 작업 전용 `known_hosts`로 지문 고정이 되는지
+- `NumberOfPasswordPrompts=1` + 방법 하나로 틀린 비밀번호가 실패 한 번(btmp 한 줄)으로 끝나는지
+- ControlPersist 시간이 지나면 마스터가 끝나는지, `ServerAliveInterval`로 망 끊김이 60초 안에 드러나는지
+- `ssh`가 3 이상 fd를 닫는지(3.1 (c) 판단 근거)
