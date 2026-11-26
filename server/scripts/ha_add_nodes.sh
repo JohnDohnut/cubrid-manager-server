@@ -311,6 +311,65 @@ node_ha_stop() {
 
 node_master_start() { node_detached cub_master; sleep 2; cub_master_running; }
 
+# undo forms: done when there is nothing left to do (the state may already be the wanted one, e.g. heartbeat stopped)
+node_server_stop_ensure() {   # stop only the ones that run
+  local db rc=0 up
+  up=" $(cubrid server status 2>/dev/null </dev/null | awk '$1 == "Server" || $1 == "HA-Server" { print $2 }' | tr '\n' ' ') "
+  for db in "$@"; do
+    if [[ $up == *" $db "* ]]; then node_server_stop "$db" || rc=1; else echo "not running: $db"; fi
+  done
+  return $rc
+}
+node_reload_ensure() {   # reload when heartbeat runs; without heartbeat the files are read at the next start
+  if ! timeout 30 cubrid heartbeat status </dev/null 2>/dev/null | grep -q "HA-Node Info"; then
+    echo "heartbeat is not running: nothing to reload"
+    return 0
+  fi
+  node_reload
+}
+repl_procs() {   # repl_procs <node>: copylogdb/applylogdb processes for that node
+  local f a
+  for f in /proc/[0-9]*/cmdline; do
+    a=$(tr '\0' ' ' < "$f" 2>/dev/null) || continue
+    case $a in *copylogdb*"@$1 "*|*copylogdb*"@$1"|*applylogdb*"_$1 "*|*applylogdb*"_$1") echo "$a" ;; esac
+  done
+}
+node_repl_stop_ensure() {   # repl stop <node>; done when no log copy or apply process for that node is left
+  local out
+  out=$(node_detached cubrid heartbeat repl stop "$1")
+  echo "$out"
+  out=$(repl_procs "$1")
+  [ -z "$out" ] && return 0
+  echo "still running: $out"
+  return 1
+}
+
+# node busy <action> [args...] : the processes of that node action that still run ("BUSY <command line>"), rc 1 if any.
+# Used before undoing on a node whose connection broke while the action ran.
+node_busy() {
+  local action=$1 f a pat=() p hit=0
+  shift
+  case $action in
+    restore) pat=("restoreslave" " $1") ;;
+    first_copylog) pat=("copylogdb" "-L $3") ;;
+    cubrid|backup) pat=("backupdb" "") ;;
+    ha_start|ha_stop) pat=("cubrid heartbeat" "") ;;
+    server_start|server_ensure|server_stop|server_stop_ensure) pat=("cubrid server" "") ;;
+    reload|reload_ensure|repl|repl_stop_ensure) pat=("cubrid heartbeat" "") ;;
+    master_down|master_start) pat=("cub_commdb" "") ;;
+    *) return 0 ;;
+  esac
+  for f in /proc/[0-9]*/cmdline; do
+    [ "${f%/cmdline}" = "/proc/$$" ] && continue
+    a=$(tr '\0' ' ' < "$f" 2>/dev/null) || continue
+    case $a in *"node busy"*) continue ;; esac
+    [[ $a == *"${pat[0]}"* ]] || continue
+    [ -z "${pat[1]}" ] || [[ $a == *"${pat[1]}"* ]] || continue
+    echo "BUSY $a"; hit=1
+  done
+  [ $hit = 0 ]
+}
+
 node_reload() {
   local out rc
   out=$(cubrid heartbeat reload 2>&1 </dev/null)
@@ -419,6 +478,10 @@ node_main() {
     ha_start) node_ha_start ;;
     ha_stop) node_ha_stop ;;
     reload) node_reload ;;
+    reload_ensure) node_reload_ensure ;;
+    busy) node_busy "$@" ;;
+    server_stop_ensure) node_server_stop_ensure "$@" ;;
+    repl_stop_ensure) node_repl_stop_ensure "$@" ;;
     repl) node_repl "$@" ;;
     hb_status) node_hb_status ;;
     server_pids) node_server_pids "$@" ;;
@@ -618,7 +681,7 @@ run_bg() {   # run_bg <limit seconds> <interruptible 0|1> <command...> ; sets OU
 on_node() {
   local host=$1 limit=$2 intr=$3
   shift 3
-  LAST_ACTION="$host $1"
+  LAST_ACTION="$host $1" LAST_ARGS="${*:2}"
   # node actions start their daemons detached (setsid, own stdin/stdout), so the channel is not held open
   log "$host: $*"
   if [ "${NODE_LOCAL[$host]:-0}" = 1 ]; then
@@ -1458,13 +1521,33 @@ undo_one() {   # undo_one <host> <kind> [args...] ; 0 when it is back
     move_back) on_node "$h" 600 0 move_back "$@" ;;
     clear) on_node "$h" 600 0 clear "$@" ;;
     server_start) [ $# -eq 0 ] && return 0; on_node "$h" 600 0 server_ensure "$@" ;;
-    server_stop) on_node "$h" 600 0 server_stop "$@" ;;
+    server_stop) on_node "$h" 600 0 server_stop_ensure "$@" ;;
     ha_stop) on_node "$h" 600 0 ha_stop ;;
     master_start) on_node "$h" 120 0 master_start ;;
-    reload) on_node "$h" 300 0 reload ;;
-    repl) on_node "$h" 300 0 repl "$@" ;;
+    reload) on_node "$h" 300 0 reload_ensure ;;
+    repl) if [ "$1" = stop ]; then on_node "$h" 300 0 repl_stop_ensure "$2"; else on_node "$h" 300 0 repl "$@"; fi ;;
     *) OUT="unknown undo $kind"; return 1 ;;
   esac
+}
+
+# node_quiet <host>: none of the commands that ran on that node when its connection broke still runs (sets BUSY_NOTE)
+node_quiet() {
+  local h=$1 e eh act rest list=() av=()
+  BUSY_NOTE=""
+  IFS=';' read -ra list <<< "${JOB[lost_actions]:-}"
+  for e in "${list[@]}"; do
+    read -r eh act rest <<< "$e"
+    [ "$eh" = "$h" ] || continue
+    read -ra av <<< "$rest"
+    on_node "$h" 60 0 busy "$act" "${av[@]}"
+    if [ "$RC" -ne 0 ]; then
+      if [ "$NO_RESULT" = 1 ] || [ "$TIMED_OUT" = 1 ]; then BUSY_NOTE="no answer"
+      else BUSY_NOTE="$act still runs there: $(printf '%s\n' "$OUT" | grep '^BUSY' | head -1 | cut -c6-200)"
+      fi
+      return 1
+    fi
+  done
+  return 0
 }
 
 # the promotion steps (convert_*) are undone only with --rollback-convert, unless the promotion itself failed
@@ -1476,9 +1559,13 @@ rollback_all() {
   log "rolling back"
   [ -s "$UNDO" ] || { log "nothing to undo"; return 0; }
   local lines=() line n step h kind args unrestored="" blocked=0
-  # once an undo fails on a node, its later lines are not run in this run (they may depend on it): they are left for
-  # a later rollback. A timeout, or a lost connection under a command that may still run, also blocks (I6).
-  local -A dead=()
+  # when a node does not answer an undo (time limit, lost connection, helper error), its later lines are not tried
+  # in this run: they are left for a later rollback. A timeout, or a lost connection under a command that may still
+  # run, also blocks (I6). Other failures are marked and the node's later lines still run (the undo forms of repl
+  # stop, reload and server stop succeed when there is nothing left to do, so a second rollback can finish).
+  local -A dead=() checked=()
+  # nodes whose connection broke under a command (this run or the job being undone): checked before their first undo
+  local lost_before=${JOB[lost_nodes]:-}
   [ "$CONVERT_LAST" -gt 0 ] || CONVERT_LAST=$(awk -F'\t' '$1 == "C" { v = $2 } END { print v + 0 }' "$UNDO")
   mapfile -t lines < <(grep '^U' "$UNDO")
   local i
@@ -1495,17 +1582,31 @@ rollback_all() {
       if [ ${#S_ID[@]} -ge "$step" ]; then step_set $((step - 1)) rollback_failed "$h: not tried (${dead[$h]})"; fi
       continue
     fi
+    if [ -z "${checked[$h]:-}" ] && [[ " ${lost_before} " == *" $h "* ]]; then
+      checked[$h]=1
+      if ! node_quiet "$h"; then
+        blocked=1; dead[$h]="$BUSY_NOTE"
+        RB_NOTE="undoing stopped on $h: $BUSY_NOTE"
+        unrestored+="$h $kind ${args//$'\t'/ };"
+        if [ ${#S_ID[@]} -ge "$step" ]; then step_set $((step - 1)) rollback_failed "$h: not tried ($BUSY_NOTE)"; fi
+        continue
+      fi
+    fi
     if undo_one "$h" "$kind" "${a[@]}"; then
       printf 'D\t%s\n' "$n" >> "$UNDO"
       if [ ${#S_ID[@]} -ge "$step" ] && [ "${S_STATE[$((step - 1))]}" != rollback_failed ]; then step_set $((step - 1)) rolled_back; fi
     else
       unrestored+="$h $kind ${args//$'\t'/ };"
+      if [ "$TIMED_OUT" = 1 ] || [ "$NO_RESULT" = 1 ]; then
+        [[ " ${JOB[lost_nodes]:-} " == *" $h "* ]] || JOB[lost_nodes]+="${JOB[lost_nodes]:+ }$h"
+        JOB[lost_actions]+="${LAST_ACTION} ${LAST_ARGS};"
+      fi
       if [ "$TIMED_OUT" = 1 ] || { [ "$NO_RESULT" = 1 ] && [ "$MAY_HAVE_RUN" = 1 ] && may_still_run "${LAST_ACTION#* }"; }; then
         blocked=1; dead[$h]="no answer to an earlier undo"
         RB_NOTE="undoing stopped on $h: $kind did not finish in time or the connection broke"
       elif [ "$NO_RESULT" = 1 ]; then dead[$h]="no answer to an earlier undo"
-      else dead[$h]="an earlier undo failed"
       fi
+      # any other failure is only marked: the node's later lines (the setting files above all) still run
       if [ ${#S_ID[@]} -ge "$step" ]; then step_set $((step - 1)) rollback_failed "$(one_line "$OUT")"; fi
       log "could not undo on $h: $kind $args ($OUT)"
     fi
@@ -1630,7 +1731,7 @@ finish() {   # finish <status>
 # rollback and cleanup work on an earlier job's folder: keep what describes that job
 if [ "$ACTION" = rollback ] || [ "$ACTION" = cleanup ]; then
   while IFS= read -r kvl; do
-    case ${kvl%%=*} in case|db_names|kept|downtime_sec) JOB[${kvl%%=*}]=${kvl#*=} ;; esac
+    case ${kvl%%=*} in case|db_names|kept|downtime_sec|lost_nodes|lost_actions) JOB[${kvl%%=*}]=${kvl#*=} ;; esac
   done < <(cat "$JOB_DIR/job" 2>/dev/null)
 fi
 JOB[uuid]=$UUID; JOB[action]=$ACTION; JOB[status]=running; JOB[phase]=$([ "$ACTION" = rollback ] && echo rollback || echo run); JOB[started_at]=$(epoch); JOB[pid]=$$
@@ -1671,6 +1772,8 @@ if [ "$ACTION" = rollback ]; then
       S_ID+=("${f[1]}"); S_TITLE+=("${f[2]}"); S_NODE+=("${f[3]}"); S_DB+=("${f[4]}"); S_STATE+=("${f[5]}"); S_DETAIL+=("${f[6]}"); S_STAGE+=("${f[7]:-}")
       # the step the job was in when it stopped
       [ "${f[5]}" = running ] && { S_STATE[${#S_STATE[@]}-1]=failed; S_DETAIL[${#S_DETAIL[@]}-1]="interrupted"; }
+      # an earlier rollback's marks are set again by this one
+      [ "${f[5]}" = rollback_failed ] && { S_STATE[${#S_STATE[@]}-1]=done; S_DETAIL[${#S_DETAIL[@]}-1]=""; }
     done < "$JOB_DIR/steps"
   fi
   for h in "${EX_HOST[@]}" "${NEW_HOST[@]}"; do NODE_LOCAL[$h]=0; done
@@ -1759,6 +1862,7 @@ for i in "${!S_ID[@]}"; do
     fi
   elif [ "$NO_RESULT" = 1 ] && [ "$MAY_HAVE_RUN" = 1 ] && may_still_run "${LAST_ACTION#* }"; then
     FAIL_CODE=connection_lost
+    JOB[lost_nodes]="${LAST_ACTION%% *}"; JOB[lost_actions]="${LAST_ACTION} ${LAST_ARGS};"
     FAIL_MSG="the connection to ${LAST_ACTION%% *} broke while ${LAST_ACTION#* } ran; it may still be running there: $FAIL_MSG"
   fi
   [ "$UNDO_FAILED" = 1 ] && { FAIL_CODE=undo_write_failed; FAIL_MSG="cannot write the undo log $UNDO: $FAIL_MSG"; }

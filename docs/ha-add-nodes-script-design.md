@@ -857,7 +857,7 @@ v5 설계 검토(인증 소켓 수명, C3 막힘, 다시 로그인 불가, 노�
 
 | 규칙 | 내용 |
 |---|---|
-| 설정 격리 | 모든 ssh 호출은 `-F <작업 폴더>/ssh_config.<실행 번호>`. 계정의 `~/.ssh/config`는 읽지 않고, 파일 끝 `Include /etc/ssh/ssh_config`로 OS 설정(RHEL crypto-policies)은 유지. ssh 설정은 먼저 나온 값이 이기므로 작업 값이 OS 값보다 앞섬. `-F /dev/null`은 쓰지 않음 |
+| 설정 격리 | 모든 ssh 호출은 `-F <작업 폴더>/ssh_config.<실행 번호>`. 계정의 `~/.ssh/config`는 읽지 않음. 파일 순서는 노드별 `Host <이름>` 블록들 → 마지막 `Host *` 블록(공통 값 + `Include /etc/ssh/ssh_config`). `Include`는 놓인 Host 블록 안에서만 걸리므로(ssh_config(5)) 노드 블록 안에 두지 않고 `Host *` 안에 둠 → OS 설정(RHEL crypto-policies)이 모든 노드에 걸림. ssh 설정은 먼저 나온 값이 이기므로 노드 값·공통 값이 OS 값보다 앞섬. 첫 동작판에서 노드 2대를 `ssh -G -F`로 비교해 확인. `-F /dev/null`은 쓰지 않음 |
 | 공통 값 | `ControlMaster no`, `BatchMode yes`, `PubkeyAuthentication no`, `GSSAPIAuthentication no`, `HostbasedAuthentication no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `ProxyJump none`, `StrictHostKeyChecking yes`, `GlobalKnownHostsFile /dev/null`, `UserKnownHostsFile <작업 known_hosts>`, `UpdateHostKeys no`, `CheckHostIP no`, `ConnectTimeout 10`, `ServerAliveInterval 15`, `ServerAliveCountMax 20`, `ForwardAgent no`, `ForwardX11 no`, `ClearAllForwardings yes` |
 | 노드마다 | `Host <요청의 host>` 블록에 `HostName`, `Port`, `User`, `ControlPath`, `HostKeyAlgorithms`. C3와 스크립트가 같은 블록을 씀(User·Port가 어긋날 일 없음) |
 | 인증 없는 호출 | 스크립트 쪽 ssh는 인증 방법이 모두 꺼져 있음. 마스터가 없을 때 보통 접속으로 넘어가도 인증 시도 없이 255로 끝남(계정 잠금 횟수가 오르지 않음). 그리고 호출 전마다 `-O check` |
@@ -956,7 +956,14 @@ S2 노드 확인 순서(127 겹침 해소)
 - `ssh_failed`: 다른 코드에 들지 않는 ssh 실패. 문구에 ssh 표준 오류 원문 한 줄(예: 키 교환·암호 협상 실패, No route to host, Network is unreachable, Connection reset by peer, Too many authentication failures)
 - `account_no_shell`: 그 계정의 로그인 셸이 로그인을 막음(nologin). 할 일: 로그인 셸 확인
 
-#### 3.8.4 실패 목록표에 바뀌는 것
+#### 3.8.4 되돌리기 (단계 1·3 규칙, 로직은 v4 그대로 옮김)
+
+- [단계 1] 되돌리기 줄의 멱등: `repl stop`은 그 노드의 copylogdb·applylogdb 프로세스가 없으면 성공, `reload`는 heartbeat가 없으면 할 것 없음(성공), `server_stop`은 떠 있지 않으면 성공, `server_start`는 떠 있으면 성공. 그래서 `rollback`을 다시 불러도 같은 줄이 상태 때문에 늘 실패하지 않음
+- [단계 1] 한 노드의 줄이 실패해도 그 노드의 남은 줄(설정 파일 복원 등)은 계속 함. 그 노드의 남은 줄을 건너뛰는 것은 답이 없을 때(제한 시간, 연결 끊김, 헬퍼 오류)뿐
+- [단계 3] 다시 로그인한 노드의 원격 명령 확인: 연결이 끊긴 노드(`lost_nodes`)를 되돌리기 전에, 끊길 때 돌던 명령(작업 파일 `lost_actions`: 노드·동작·인자)이 그 노드에서 아직 도는지 먼저 봄(`ha_node.sh busy <동작> <인자>`: restore → restoreslave + DB 이름, first_copylog → copylogdb + 복사 폴더, backup → backupdb, HA·서버 동작 → 그 유틸리티 프로세스). 돌고 있으면 그 노드는 하지 않고 `rollback_blocked`(잠금 유지), 없을 때만 되돌림. v4 구현에 이미 넣음(가짜 restoreslave 프로세스로 실측: 도는 동안 `rollback_blocked`, 끝난 뒤 `rolled_back`)
+- [단계 3] `rollback` 동작은 이전 되돌리기의 `rollback_failed` 표시를 지우고 이번 결과로 다시 표시함
+
+#### 3.8.5 실패 목록표에 바뀌는 것
 
 - 2.1의 "되돌리기에서 그 노드에 다시 접속(헬퍼가 새 세션)"은 v5에서 성립하지 않음: 끊긴 노드는 그 실행에서 다시 접속하지 않고 `unrestored`로 남김. 사용자가 비밀번호를 다시 넣어 `rollback`(화면 기본 흐름)
 - S13·S14(또는 다른 오래 걸리는 명령) 중 `connection_lost`는 `rollback_blocked`(원격 restoreslave가 계속 돌 수 있음. v4에서 이미 같게 고침)
