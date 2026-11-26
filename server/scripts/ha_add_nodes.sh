@@ -321,10 +321,13 @@ node_server_stop_ensure() {   # stop only the ones that run
   return $rc
 }
 node_reload_ensure() {   # reload when heartbeat runs; without heartbeat the files are read at the next start
-  if ! timeout 30 cubrid heartbeat status </dev/null 2>/dev/null | grep -q "HA-Node Info"; then
-    echo "heartbeat is not running: nothing to reload"
-    return 0
-  fi
+  local out rc
+  cub_master_running || { echo "cub_master is not running: nothing to reload"; return 0; }
+  out=$(timeout 30 cubrid heartbeat status </dev/null 2>&1)
+  rc=$?
+  # no answer is not "no heartbeat": the reload is not skipped then
+  [ $rc -eq 124 ] && { echo "heartbeat status did not answer in 30 s"; return 1; }
+  case $out in *"not configured for HA"*) echo "not in HA mode: nothing to reload"; return 0 ;; esac
   node_reload
 }
 repl_procs() {   # repl_procs <node>: copylogdb/applylogdb processes for that node
@@ -336,10 +339,14 @@ repl_procs() {   # repl_procs <node>: copylogdb/applylogdb processes for that no
 }
 node_repl_stop_ensure() {   # repl stop <node>; done when no log copy or apply process for that node is left
   local out
+  local i
   out=$(node_detached cubrid heartbeat repl stop "$1")
   echo "$out"
-  out=$(repl_procs "$1")
-  [ -z "$out" ] && return 0
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    out=$(repl_procs "$1")
+    [ -z "$out" ] && return 0
+    sleep 1
+  done
   echo "still running: $out"
   return 1
 }
@@ -350,12 +357,11 @@ node_busy() {
   local action=$1 f a pat=() p hit=0
   shift
   case $action in
-    restore) pat=("restoreslave" " $1") ;;
+    restore) pat=("restoreslave" " $1 ") ;;
     first_copylog) pat=("copylogdb" "-L $3") ;;
     cubrid|backup) pat=("backupdb" "") ;;
-    ha_start|ha_stop) pat=("cubrid heartbeat" "") ;;
-    server_start|server_ensure|server_stop|server_stop_ensure) pat=("cubrid server" "") ;;
-    reload|reload_ensure|repl|repl_stop_ensure) pat=("cubrid heartbeat" "") ;;
+    ha_start|ha_stop|reload|reload_ensure|repl|repl_stop_ensure) pat=("cubrid heartbeat " "") ;;
+    server_start|server_ensure|server_stop|server_stop_ensure) pat=("cubrid server " "") ;;
     master_down|master_start) pat=("cub_commdb" "") ;;
     *) return 0 ;;
   esac
@@ -364,6 +370,10 @@ node_busy() {
     a=$(tr '\0' ' ' < "$f" 2>/dev/null) || continue
     case $a in *"node busy"*) continue ;; esac
     [[ $a == *"${pat[0]}"* ]] || continue
+    # the utilities that change something, not someone's status call
+    case ${pat[0]} in
+      "cubrid heartbeat "|"cubrid server ") [[ $a =~ cubrid\ (heartbeat|server)\ (start|stop|reload|repl|replication) ]] || continue ;;
+    esac
     [ -z "${pat[1]}" ] || [[ $a == *"${pat[1]}"* ]] || continue
     echo "BUSY $a"; hit=1
   done
@@ -561,23 +571,23 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
 # ------------------------------------------------ job and step state files (read by the manager)
 
 declare -A JOB=()
-job_write() {
-  local k tmp="$JOB_DIR/job.tmp"
-  : > "$tmp"
-  for k in "${!JOB[@]}"; do printf '%s=%s\n' "$k" "$(one_line "${JOB[$k]}")" >> "$tmp"; done
-  mv -f "$tmp" "$JOB_DIR/job"
+job_write() {   # swapped in only when the whole file was written (a full disk keeps the last good state)
+  local k tmp="$JOB_DIR/job.tmp" ok=1
+  : > "$tmp" || return 1
+  for k in "${!JOB[@]}"; do printf '%s=%s\n' "$k" "$(one_line "${JOB[$k]}")" >> "$tmp" || ok=0; done
+  [ $ok = 1 ] && mv -f "$tmp" "$JOB_DIR/job"
 }
 job_set() { JOB[$1]=$2; job_write; }
 
 S_ID=() S_TITLE=() S_NODE=() S_DB=() S_STATE=() S_DETAIL=() S_STAGE=()
 steps_write() {
-  local i tmp="$JOB_DIR/steps.tmp"
-  : > "$tmp"
+  local i tmp="$JOB_DIR/steps.tmp" ok=1
+  : > "$tmp" || return 1
   for i in "${!S_ID[@]}"; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$((i + 1))" "${S_ID[$i]}" "${S_TITLE[$i]}" "${S_NODE[$i]}" "${S_DB[$i]}" \
-      "${S_STATE[$i]}" "$(one_line "${S_DETAIL[$i]}")" "${S_STAGE[$i]:-}" >> "$tmp"
+      "${S_STATE[$i]}" "$(one_line "${S_DETAIL[$i]}")" "${S_STAGE[$i]:-}" >> "$tmp" || ok=0
   done
-  mv -f "$tmp" "$JOB_DIR/steps"
+  [ $ok = 1 ] && mv -f "$tmp" "$JOB_DIR/steps"
 }
 step_add() { S_STAGE+=("$1"); S_ID+=("$2"); S_TITLE+=("$3"); S_NODE+=("$4"); S_DB+=("$5"); S_STATE+=(pending); S_DETAIL+=(""); }
 step_set() { S_STATE[$1]=$2; [ $# -ge 3 ] && S_DETAIL[$1]=$3; steps_write; }
@@ -1494,7 +1504,17 @@ master_guard() {   # master_guard <index>: before S9 record, before the first S1
     new_ha_start|existing_config) [ "$prev" = "$id" ] && return 0; [ -n "$MSNAP" ] || return 0 ;;
     *) return 0 ;;
   esac
-  master_state || { fail master_changed "$MASTER_HOST: cannot read the state of the master ($(one_line "$OUT"))"; return 1; }
+  # a busy server can answer changemode with "unknown" once: read up to 5 times, 3 s apart, before deciding
+  local try
+  for try in 1 2 3 4 5; do
+    master_state || { fail master_changed "$MASTER_HOST: cannot read the state of the master ($(one_line "$OUT"))"; return 1; }
+    if [ "$id" = backup ]; then
+      printf '%s\n' "$MSTATE" | awk '$2 != "active" || $3 == "none" { bad = 1 } END { exit !bad }' || break
+    else
+      [ "$MSTATE" != "$MSNAP" ] || break
+    fi
+    [ $try -lt 5 ] && sleep 3
+  done
   if [ "$id" = backup ]; then
     if printf '%s\n' "$MSTATE" | awk '$2 != "active" || $3 == "none" { bad = 1 } END { exit !bad }'; then
       fail master_changed "$MASTER_HOST is not the active master of every database: $(one_line "$MSTATE")"; return 1
@@ -1584,7 +1604,14 @@ rollback_all() {
     fi
     if [ -z "${checked[$h]:-}" ] && [[ " ${lost_before} " == *" $h "* ]]; then
       checked[$h]=1
-      if ! node_quiet "$h"; then
+      if node_quiet "$h"; then
+        # checked: nothing from before the broken connection runs there any more
+        local ln="" x en="" e2
+        for x in ${JOB[lost_nodes]:-}; do [ "$x" = "$h" ] || ln+="${ln:+ }$x"; done
+        IFS=';' read -ra e2 <<< "${JOB[lost_actions]:-}"
+        for x in "${e2[@]}"; do [ -n "$x" ] && [ "${x%% *}" != "$h" ] && en+="$x;"; done
+        JOB[lost_nodes]=$ln; JOB[lost_actions]=$en; job_write
+      else
         blocked=1; dead[$h]="$BUSY_NOTE"
         RB_NOTE="undoing stopped on $h: $BUSY_NOTE"
         unrestored+="$h $kind ${args//$'\t'/ };"
@@ -1605,6 +1632,10 @@ rollback_all() {
         blocked=1; dead[$h]="no answer to an earlier undo"
         RB_NOTE="undoing stopped on $h: $kind did not finish in time or the connection broke"
       elif [ "$NO_RESULT" = 1 ]; then dead[$h]="no answer to an earlier undo"
+      else
+        # the undo forms are idempotent: a stop that fails means something still runs there, and the node's later
+        # lines (remove, clear, move_back) would act under it
+        case $kind in ha_stop|server_stop|repl|master_down) dead[$h]="$kind failed: something may still run" ;; esac
       fi
       # any other failure is only marked: the node's later lines (the setting files above all) still run
       if [ ${#S_ID[@]} -ge "$step" ]; then step_set $((step - 1)) rollback_failed "$(one_line "$OUT")"; fi

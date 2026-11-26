@@ -40,7 +40,7 @@ main() {
   while kill -0 "$pid" 2>/dev/null; do wait "$pid"; done
   # the node blocks only (not patterns such as the common "Host *")
   for h in $(awk '$1 == "Host" { for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) print $i }' "$cfg"); do
-    ssh -F "$cfg" -O exit "$h" </dev/null >/dev/null 2>&1
+    timeout 10 ssh -F "$cfg" -O exit "$h" </dev/null >/dev/null 2>&1
   done
   case $cp in */hs?*) rm -rf -- "$cp" ;; esac
   return 0
