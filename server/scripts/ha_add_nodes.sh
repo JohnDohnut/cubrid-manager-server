@@ -16,7 +16,7 @@
 #
 # ha_add_nodes.sh - promote a single database server to an HA master and/or add slaves and replicas to an HA group.
 #
-#   ha_add_nodes.sh <plan|run|rollback|cleanup> --job-dir <dir> [--agent <socket>] [options]
+#   ha_add_nodes.sh <plan|run|rollback|cleanup> --job-dir <dir> --ssh-config <file> [--node-script-sha256 <hex>] [options]
 #     --master-host <name>            this server's HA node name (default: uname -n)
 #     --db <db>                       (single server only) a database to put into HA; repeat for more
 #     --confirm-master-restart        (single server) the running databases restart
@@ -25,22 +25,24 @@
 #     --new <slave|replica>:<host>:<port>:<user>[:<fingerprint>]       a new node; repeat
 #     --existing <host>:<port>:<user>[:<fingerprint>]                  an existing node of the group; repeat
 #     --repl-log-home <path>          new nodes' replication log folder (default: their $CUBRID_DATABASES)
-#     --backup-path <path>            backup folder on this server (default: $CUBRID_DATABASES/ha_add_nodes_backup)
-#     --remote-backup-path <path>     folder for the received backup on new nodes (same default there)
+#     --backup-path <path>            the backup goes under <path>/ha_add_nodes_backup (default <path>: $CUBRID_DATABASES)
+#     --remote-backup-path <path>     the same on the new nodes (default: their $CUBRID_DATABASES)
 #     --ha-group <name> --ha-port-id <port>   (single server) HA group name (default cubrid) and port (59901)
 #     --rollback-convert              on failure after the promotion, go back to a single server as well
 #     --no-start-ha                   prepare the new nodes but do not start HA on them
 #     --keep <host>:<path>            (cleanup) an old database folder a successful job kept aside; repeat
 #
 # Every value is an argument; nothing in this file is meant to be edited. Passwords never reach this script: the
-# ssh agent (cm_ssh agent, started by the manager or, from a terminal, by this script with --ask) holds them and
-# runs the remote commands. The fingerprints in --new/--existing are only used when this script starts the agent.
+# manager logs in to every node first (one ssh ControlMaster per node) and gives the job's ssh settings file
+# (--ssh-config); every ssh here goes through those connections with all authentication turned off.
 #
-# Remote work runs this same file on the node: "ha_add_nodes.sh node <action> ...". Each node action prints its
-# result between "@@BEGIN" and "@@END <status>" lines, so text printed by login files does not mix in.
+# Work on a node runs the installed node script: "ssh <node> <$CUBRID>/share/cms/ha_node.sh" with the call on stdin;
+# this server runs its own ha_node.sh the same way. --node-script-sha256 is the manager's reference hash of it.
 
-SELF=$(readlink -f "$0")
+{
 PROG=ha_add_nodes.sh
+# the manager runs this file from fd 3 (the descriptor it hashed): not passed on to the servers started here
+exec 3<&-
 
 # --------------------------------------------------------------------------- common helpers (both sides)
 
@@ -58,38 +60,6 @@ proc_start() {
   printf '%s' "${20}"
 }
 
-# --------------------------------------------------------------------------- node actions
-
-# CUBRID environment for a login shell that is not bash (csh/tcsh keep it in .cshrc)
-node_env_bootstrap() {
-  [ -n "${CUBRID:-}" ] && return 0
-  local sh_ line
-  sh_=$(getent passwd "$(id -un)" | cut -d: -f7)
-  case $sh_ in
-    */csh|*/tcsh)
-      while IFS= read -r line; do
-        case $line in
-          CUBRID=*|CUBRID_DATABASES=*|PATH=*|LD_LIBRARY_PATH=*) export "${line?}" ;;
-        esac
-      done < <("$sh_" -c 'echo "CUBRID=$CUBRID"; echo "CUBRID_DATABASES=$CUBRID_DATABASES"; echo "PATH=$PATH"; echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"' </dev/null 2>/dev/null)
-      ;;
-  esac
-}
-
-cub_master_running() {
-  local f c me
-  me=$(id -u)
-  for f in /proc/[0-9]*; do
-    [ -O "$f" ] || continue
-    c=$(tr '\0' ' ' < "$f/cmdline" 2>/dev/null) || continue
-    case " $c" in
-      " cub_master "*|*"/cub_master "*) return 0 ;;
-    esac
-  done
-  return 1
-}
-
-# key=value of one [section] (last value wins)
 conf_get() {
   awk -v sec="$2" -v key="$3" '
     { t=$0; gsub(/^[ \t]+|[ \t]+$/, "", t) }
@@ -111,432 +81,27 @@ conf_pairs() {
     END { for (j=1; j<=n; j++) printf "%s\t%s\n", order[j], seen[order[j]] }' "$1" 2>/dev/null
 }
 
-# keep path.bak.<tag> (or an empty path.new.<tag> marker when there was no file), then write the new content.
-# The undo looks at which of the two exists.
-backup_once() {
-  local path=$1 tag=$2
-  if [ -e "$path.bak.$tag" ] || [ -e "$path.new.$tag" ]; then return 0; fi
-  if [ -e "$path" ]; then cp -p "$path" "$path.bak.$tag" || return 1
-  else : > "$path.new.$tag" || return 1
-  fi
-}
-
-replace_file() {   # replace_file <path> <tmp> : atomic, keeps the mode of the old file
-  [ -e "$1" ] && chmod --reference="$1" "$2" 2>/dev/null
-  mv -f "$2" "$1"
-}
-
-# node conf_edit <file> <tag> <section> <key> <value> [<section> <key> <value> ...]
-node_conf_edit() {
-  local file=$1 tag=$2 edits="" tmp
-  shift 2
-  while [ $# -ge 3 ]; do edits+="$1"$'\t'"$2"$'\t'"$3"$'\n'; shift 3; done
-  backup_once "$file" "$tag" || { echo "cannot keep a copy of $file"; return 1; }
-  tmp="$file.tmp.$tag"
-  [ -e "$file" ] || : > "$file"
-  EDITS=$edits awk '
-    BEGIN { n=split(ENVIRON["EDITS"], E, "\n"); m=0
-            for (i=1; i<=n; i++) { if (E[i] == "") continue; split(E[i], f, "\t"); m++; sec[m]=f[1]; key[m]=f[2]; val[m]=f[3] } }
-    function flush(s,   i) { for (i=1; i<=m; i++) if (sec[i] == s && !done[i]) { print key[i] "=" val[i]; done[i]=1 } }
-    { line=$0; t=line; gsub(/^[ \t]+|[ \t]+$/, "", t) }
-    t ~ /^\[/ { if (cur != "") flush(cur); cur=t; seen[t]=1; print line; next }
-    t !~ /^#/ && index(t, "=") > 0 {
-      k=substr(t, 1, index(t, "=")-1); gsub(/[ \t]+$/, "", k); hit=0
-      for (i=1; i<=m; i++) if (sec[i] == cur && key[i] == k) { if (!done[i]) { print k "=" val[i]; done[i]=1 }; hit=1 }
-      if (hit) next
-    }
-    { print line }
-    END { if (cur != "") flush(cur)
-          for (i=1; i<=m; i++) if (!done[i]) { if (!(sec[i] in seen)) { print ""; print sec[i]; seen[sec[i]]=1 } flush(sec[i]) } }
-  ' "$file" > "$tmp" && replace_file "$file" "$tmp"
-}
-
-# node dbtxt_put <tag> <db> <vol> <hosts> <log> [<lob>] : the databases.txt line of <db>
-node_dbtxt_put() {
-  local tag=$1 db=$2 line file="$CUBRID_DATABASES/databases.txt" tmp
-  line="$2 $3 $4 $5${6:+ $6}"
-  backup_once "$file" "$tag" || return 1
-  tmp="$file.tmp.$tag"
-  [ -e "$file" ] || : > "$file"
-  awk -v db="$db" -v line="$line" '
-    { split($0, f, /[ \t]+/); t=$0; sub(/^[ \t]+/, "", t); split(t, g, /[ \t]+/) }
-    g[1] == db && t !~ /^#/ { if (!done) print line; done=1; next }
-    { print }
-    END { if (!done) print line }' "$file" > "$tmp" && replace_file "$file" "$tmp"
-}
-
-# node dbtxt_add_hosts <tag> <host,host> <db> [<db> ...] : add hosts to the db-host field (end of the list)
-node_dbtxt_add_hosts() {
-  local tag=$1 hosts=$2 file="$CUBRID_DATABASES/databases.txt" tmp dbs
-  shift 2
-  dbs=" $* "
-  backup_once "$file" "$tag" || return 1
-  tmp="$file.tmp.$tag"
-  awk -v dbs="$dbs" -v add="$hosts" '
-    { t=$0; sub(/^[ \t]+/, "", t); n=split(t, g, /[ \t]+/) }
-    t !~ /^#/ && n >= 4 && index(dbs, " " g[1] " ") > 0 {
-      split(g[3], h, ":"); for (k in h) have[h[k]]=1; out=g[3]
-      na=split(add, a, ","); for (k=1; k<=na; k++) if (!(a[k] in have)) out=out ":" a[k]
-      delete have; g[3]=out; s=g[1]; for (k=2; k<=n; k++) s=s " " g[k]; print s; next }
-    { print }' "$file" > "$tmp" && replace_file "$file" "$tmp"
-}
-
-# node undo_file <path> <tag> : the copy back, or the file removed when there was none
-node_undo_file() {
-  local path=$1 tag=$2
-  if [ -e "$path.bak.$tag" ]; then mv -f "$path.bak.$tag" "$path" && echo "restored $path"
-  elif [ -e "$path.new.$tag" ]; then rm -f "$path" "$path.new.$tag" && echo "removed $path (it did not exist)"
-  else echo "nothing to undo for $path"
-  fi
-}
-
-node_drop_backups() {   # node drop_backups <tag> <path>... : after success, remove the kept copies
-  local tag=$1 p
-  shift
-  for p in "$@"; do rm -f "$p.bak.$tag" "$p.new.$tag"; done
-}
-
-node_info() {
-  local sh_ rel
-  sh_=$(getent passwd "$(id -un)" | cut -d: -f7)
-  echo "HOSTNAME=$(uname -n)"
-  echo "LOGIN_SHELL=$sh_"
-  echo "CUBRID=${CUBRID:-}"
-  echo "CUBRID_DATABASES=${CUBRID_DATABASES:-}"
-  rel=$("$CUBRID/bin/cubrid_rel" 2>/dev/null </dev/null | grep -m1 CUBRID)
-  echo "REL=$rel"
-  echo "VERSION=$(printf '%s' "$rel" | sed -n 's/.*(\([0-9][0-9.]*\)[-)].*/\1/p')"
-  echo "HA_MODE=$(conf_get "$CUBRID/conf/cubrid.conf" "[common]" ha_mode)"
-  local f="$CUBRID/conf/cubrid_ha.conf"
-  echo "HA_NODE_LIST=$(conf_get "$f" "[common]" ha_node_list)"
-  echo "HA_REPLICA_LIST=$(conf_get "$f" "[common]" ha_replica_list)"
-  echo "HA_DB_LIST=$(conf_get "$f" "[common]" ha_db_list)"
-  echo "HA_SYNC=$(conf_get "$f" "[common]" ha_copy_sync_mode)"
-  echo "HA_COPY_LOG_BASE=$(conf_get "$f" "[common]" ha_copy_log_base)"
-  if cub_master_running; then echo "CUB_MASTER=yes"; else echo "CUB_MASTER=no"; fi
-  echo "SERVERS=$(cubrid server status 2>/dev/null </dev/null | awk '$1 == "Server" || $1 == "HA-Server" { print $2 }' | tr '\n' ' ')"
-  echo "DBTXT=$(awk '$1 !~ /^#/ && NF >= 4 { print $1 }' "$CUBRID_DATABASES/databases.txt" 2>/dev/null | tr '\n' ' ')"
-  # name:volume:log of every registered database (S2 refuses paths that overlap another database's)
-  echo "DBPATHS=$(awk '$1 !~ /^#/ && NF >= 4 { print $1 ":" $2 ":" $4 }' "$CUBRID_DATABASES/databases.txt" 2>/dev/null | tr '\n' ' ')"
-  if timeout 15 cubrid heartbeat status </dev/null 2>/dev/null | grep -q "HA-Node Info"; then echo "HEARTBEAT=yes"; else echo "HEARTBEAT=no"; fi
-  echo "CUBRID_PORT_ID=$(conf_get "$CUBRID/conf/cubrid.conf" "[common]" cubrid_port_id)"
-}
-
-# the nearest folder of a path that exists (the path itself when it exists)
-existing_ancestor() { local p=$1; while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done; printf '%s' "$p"; }
-
-node_writable() {   # node writable <path>... : "OK <path> <free bytes>" or "NO <path> <folder that is not writable>"
-  local p a
-  for p in "$@"; do
-    a=$(existing_ancestor "$p")
-    if [ -d "$a" ] && [ -w "$a" ]; then echo "OK $p $(df -Pk "$a" 2>/dev/null | awk 'NR == 2 { print $4 * 1024 }')"
-    else echo "NO $p $a"
-    fi
-  done
-}
-
-node_resolve() {   # node resolve <name>... : prints the names that do not resolve
-  local n bad=""
-  for n in "$@"; do getent hosts "$n" >/dev/null 2>&1 || bad+=" $n"; done
-  echo "UNRESOLVED=${bad# }"
-}
-
-node_free_bytes() { df -Pk "$(existing_ancestor "$1")" 2>/dev/null | awk 'NR == 2 { print $4 * 1024 }'; }
-
-node_mode() {   # node mode <db>... : "<db> <active|standby|...>"
-  local db out t0
-  for db in "$@"; do
-    t0=$SECONDS
-    # a server that is busy can keep changemode waiting; the caller asks again
-    out=$(timeout 20 cubrid changemode "$db@localhost" 2>&1 </dev/null)
-    [ $(( SECONDS - t0 )) -ge 5 ] && echo "# changemode $db took $(( SECONDS - t0 )) s"
-    case $out in
-      *"is active"*) echo "$db active" ;;
-      *"is standby"*) echo "$db standby" ;;
-      *"to-be-active"*) echo "$db to-be-active" ;;
-      *"to-be-standby"*) echo "$db to-be-standby" ;;
-      *"not configured for HA"*) echo "$db not_ha" ;;
-      *) echo "$db unknown $(one_line "$out")" ;;
-    esac
-  done
-}
-
-# long-lived processes are started detached from everything this script holds open
-node_detached() {   # node detached <command...>
-  local out rc
-  out=$(mktemp) || return 1
-  setsid "$@" </dev/null >"$out" 2>&1
-  rc=$?
-  cat "$out"
-  rm -f "$out"
-  return $rc
-}
-
-node_cubrid() { cubrid "$@" 2>&1 </dev/null; }
-
-node_server_start() { local db rc=0; for db in "$@"; do node_detached cubrid server start "$db" || rc=1; done; return $rc; }
-node_server_ensure() {   # node server_ensure <db>... : start only the ones that do not run (an undo may find them running)
-  local db rc=0 up
-  up=" $(cubrid server status 2>/dev/null </dev/null | awk '$1 == "Server" || $1 == "HA-Server" { print $2 }' | tr '\n' ' ') "
-  for db in "$@"; do
-    if [[ $up == *" $db "* ]]; then echo "already running: $db"; else node_detached cubrid server start "$db" || rc=1; fi
-  done
-  return $rc
-}
-node_server_stop() { local db rc=0 out; for db in "$@"; do out=$(cubrid server stop "$db" 2>&1 </dev/null) || rc=1; echo "$out"; [[ $out == *": fail"* ]] && rc=1; done; return $rc; }
-
-node_master_down() {   # cub_master down (`cubrid master stop` is cub_commdb -A); the manager keeps running
-  local i
-  cub_master_running || { echo "no cub_master"; return 0; }
-  cub_commdb -A </dev/null 2>&1
-  for i in $(seq 1 30); do cub_master_running || { echo "cub_master stopped"; return 0; }; sleep 1; done
-  echo "cub_master did not stop"
-  return 1
-}
-
-node_ha_start() {   # heartbeat start for the whole node (every database of ha_db_list)
-  local out rc
-  out=$(node_detached cubrid heartbeat start)
-  rc=$?
-  echo "$out"
-  [ $rc -eq 0 ] && [[ $out != *": fail"* ]]
-}
-
-node_ha_stop() {
-  local out
-  out=$(node_detached cubrid heartbeat stop)
-  echo "$out"
-  node_master_down
-}
-
-node_master_start() { node_detached cub_master; sleep 2; cub_master_running; }
-
-# undo forms: done when there is nothing left to do (the state may already be the wanted one, e.g. heartbeat stopped)
-node_server_stop_ensure() {   # stop only the ones that run
-  local db rc=0 up
-  up=" $(cubrid server status 2>/dev/null </dev/null | awk '$1 == "Server" || $1 == "HA-Server" { print $2 }' | tr '\n' ' ') "
-  for db in "$@"; do
-    if [[ $up == *" $db "* ]]; then node_server_stop "$db" || rc=1; else echo "not running: $db"; fi
-  done
-  return $rc
-}
-node_reload_ensure() {   # reload when heartbeat runs; without heartbeat the files are read at the next start
-  local out rc
-  cub_master_running || { echo "cub_master is not running: nothing to reload"; return 0; }
-  out=$(timeout 30 cubrid heartbeat status </dev/null 2>&1)
-  rc=$?
-  # no answer is not "no heartbeat": the reload is not skipped then
-  [ $rc -eq 124 ] && { echo "heartbeat status did not answer in 30 s"; return 1; }
-  case $out in *"not configured for HA"*) echo "not in HA mode: nothing to reload"; return 0 ;; esac
-  node_reload
-}
-repl_procs() {   # repl_procs <node>: copylogdb/applylogdb processes for that node
-  local f a
-  for f in /proc/[0-9]*/cmdline; do
-    a=$(tr '\0' ' ' < "$f" 2>/dev/null) || continue
-    case $a in *copylogdb*"@$1 "*|*copylogdb*"@$1"|*applylogdb*"_$1 "*|*applylogdb*"_$1") echo "$a" ;; esac
-  done
-}
-node_repl_stop_ensure() {   # repl stop <node>; done when no log copy or apply process for that node is left
-  local out
-  local i
-  out=$(node_detached cubrid heartbeat repl stop "$1")
-  echo "$out"
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    out=$(repl_procs "$1")
-    [ -z "$out" ] && return 0
-    sleep 1
-  done
-  echo "still running: $out"
-  return 1
-}
-
-# node busy <action> [args...] : the processes of that node action that still run ("BUSY <command line>"), rc 1 if any.
-# Used before undoing on a node whose connection broke while the action ran.
-node_busy() {
-  local action=$1 f a pat=() p hit=0
-  shift
-  case $action in
-    restore) pat=("restoreslave" " $1 ") ;;
-    first_copylog) pat=("copylogdb" "-L $3") ;;
-    cubrid|backup) pat=("backupdb" "") ;;
-    ha_start|ha_stop|reload|reload_ensure|repl|repl_stop_ensure) pat=("cubrid heartbeat " "") ;;
-    server_start|server_ensure|server_stop|server_stop_ensure) pat=("cubrid server " "") ;;
-    master_down|master_start) pat=("cub_commdb" "") ;;
-    *) return 0 ;;
-  esac
-  for f in /proc/[0-9]*/cmdline; do
-    [ "${f%/cmdline}" = "/proc/$$" ] && continue
-    a=$(tr '\0' ' ' < "$f" 2>/dev/null) || continue
-    case $a in *"node busy"*) continue ;; esac
-    [[ $a == *"${pat[0]}"* ]] || continue
-    # the utilities that change something, not someone's status call
-    case ${pat[0]} in
-      "cubrid heartbeat "|"cubrid server ") [[ $a =~ cubrid\ (heartbeat|server)\ (start|stop|reload|repl|replication) ]] || continue ;;
-    esac
-    [ -z "${pat[1]}" ] || [[ $a == *"${pat[1]}"* ]] || continue
-    echo "BUSY $a"; hit=1
-  done
-  [ $hit = 0 ]
-}
-
-node_reload() {
-  local out rc
-  out=$(cubrid heartbeat reload 2>&1 </dev/null)
-  rc=$?
-  echo "$out"
-  [ $rc -eq 0 ] && [[ $out != *fail* ]]
-}
-
-node_repl() {   # node repl <start|stop> <node> : success only when the output has no failure line
-  local out rc
-  out=$(node_detached cubrid heartbeat repl "$1" "$2")
-  rc=$?
-  echo "$out"
-  [ $rc -eq 0 ] && [[ $out != *": fail"* ]] && [[ $out != *"not listed"* ]]
-}
-
-node_server_pids() {   # node server_pids <db>... : "<db> <pid> <pid start time>" (none when it does not run)
-  local st db pid
-  st=$(cubrid server status 2>/dev/null </dev/null)
-  for db in "$@"; do
-    pid=$(printf '%s\n' "$st" | sed -n "s/^ *\(HA-\)\{0,1\}Server $db (.*pid \([0-9]*\)).*/\2/p" | head -1)
-    echo "$db ${pid:-none} $(proc_start "${pid:-0}")"
-  done
-}
-
-node_hb_status() { timeout 30 cubrid heartbeat status 2>&1 </dev/null; }
-
-node_exists() { local p; for p in "$@"; do [ -e "$p" ] && echo "EXISTS $p" || echo "MISSING $p"; done; }
-
-# node keep_old <suffix> <db> <vol> <log> <repl_home> [<node>...] : move what is there aside; print MOVED/PARENT/CREATED/EMPTY
-# lines. Log copy folders: only <repl_home>/<db>_<node> of the given HA nodes (not every <db>_* name: another
-# database can be called <db>_something)
-# (PARENT: a missing parent folder that mkdir -p creates, outermost first)
-node_keep_old() {
-  local suffix=$1 db=$2 vol=$3 log=$4 home=$5 p d a x paths=("$3") parents
-  shift 5
-  [ "$log" = "$vol" ] || paths+=("$log")
-  for p in "${paths[@]}"; do
-    if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
-      mv "$p" "$p$suffix" && echo "MOVED $p" || return 1
-    fi
-  done
-  for x in "$@"; do
-    d="$home/${db}_$x"
-    [ -d "$d" ] || continue
-    mv "$d" "$d$suffix" && echo "MOVED $d" || return 1
-  done
-  for p in "${paths[@]}"; do
-    if [ -d "$p" ]; then echo "EMPTY $p"; continue; fi
-    parents=() a=$(dirname "$p")
-    while [ ! -e "$a" ] && [ "$a" != / ]; do parents=("$a" "${parents[@]}"); a=$(dirname "$a"); done
-    mkdir -p "$p" || return 1
-    for a in "${parents[@]}"; do echo "PARENT $a"; done
-    echo "CREATED $p"
-  done
-}
-
-node_move_back() {   # node move_back <path> <moved path>
-  [ -e "$2" ] || { echo "nothing at $2"; return 0; }
-  if [ -e "$1" ]; then rm -rf "$1" || return 1; fi
-  mv "$2" "$1" && echo "moved back $1"
-}
-
-# node clear <created|empty> <path> : what the job wrote into a folder it created (or found empty)
-node_clear() {
-  case $1 in
-    created) rm -rf "$2" ;;
-    empty) [ -d "$2" ] || return 0; ( shopt -s dotglob nullglob; rm -rf -- "$2"/* ) ;;
-  esac
-}
-
-node_remove() { local p; for p in "$@"; do rm -rf "$p"; done; }
-
-node_restore() {   # node restore <db> <backup dir> <log path> <master> <source state>
-  # -u: the volumes go where this node's databases.txt says, not where they were on the master
-  cp -f "$2/${1}_bkvinf" "$3/" || return 1
-  cubrid restoreslave -s "$5" -m "$4" -u -B "$2" "$1" 2>&1 </dev/null
-}
-
-node_first_copylog() {   # node first_copylog <db> <master> <dir>
-  mkdir -p "$3" || return 1
-  cub_admin copylogdb -L "$3" -m async --start-page-id=-1 "$1@$2" 2>&1 </dev/null
-}
-
-node_main() {
-  local action=$1 rc
-  shift
-  node_env_bootstrap
-  echo "@@BEGIN"
-  case $action in
-    info) node_info ;;
-    resolve) node_resolve "$@" ;;
-    free) node_free_bytes "$@" ;;
-    writable) node_writable "$@" ;;
-    mode) node_mode "$@" ;;
-    conf_edit) node_conf_edit "$@" ;;
-    dbtxt_put) node_dbtxt_put "$@" ;;
-    dbtxt_add_hosts) node_dbtxt_add_hosts "$@" ;;
-    undo_file) node_undo_file "$@" ;;
-    drop_backups) node_drop_backups "$@" ;;
-    server_start) node_server_start "$@" ;;
-    server_ensure) node_server_ensure "$@" ;;
-    server_stop) node_server_stop "$@" ;;
-    master_down) node_master_down ;;
-    master_start) node_master_start ;;
-    ha_start) node_ha_start ;;
-    ha_stop) node_ha_stop ;;
-    reload) node_reload ;;
-    reload_ensure) node_reload_ensure ;;
-    busy) node_busy "$@" ;;
-    server_stop_ensure) node_server_stop_ensure "$@" ;;
-    repl_stop_ensure) node_repl_stop_ensure "$@" ;;
-    repl) node_repl "$@" ;;
-    hb_status) node_hb_status ;;
-    server_pids) node_server_pids "$@" ;;
-    exists) node_exists "$@" ;;
-    keep_old) node_keep_old "$@" ;;
-    move_back) node_move_back "$@" ;;
-    clear) node_clear "$@" ;;
-    remove) node_remove "$@" ;;
-    rmdir_empty) rmdir "$1" 2>/dev/null; true ;;
-    mkdir) mkdir -p "$@" ;;
-    restore) node_restore "$@" ;;
-    first_copylog) node_first_copylog "$@" ;;
-    cubrid) node_cubrid "$@" ;;
-    *) echo "unknown node action $action"; false ;;
-  esac
-  rc=$?
-  echo "@@END $rc"
-  return $rc
-}
-
-if [ "${1:-}" = node ]; then
-  shift
-  node_main "$@" </dev/null
-  exit $?
-fi
 
 # --------------------------------------------------------------------------- orchestration (on this server, L)
 
 umask 077
 [ -n "${CUBRID:-}" ] || { echo "$PROG: CUBRID is not set" >&2; exit 2; }
-CM_SSH="$CUBRID/bin/cm_ssh"
+NODE_SCRIPT_L="$CUBRID/share/cms/ha_node.sh"
 CANCEL=0
 IN_ROLLBACK=0
 
-usage() { sed -n '/^# ha_add_nodes.sh - /,/^# Every value/p' "$SELF" | sed '$d; s/^# \{0,1\}//'; }
+usage() { echo "usage: $PROG <plan|run|rollback|cleanup> --job-dir <dir> --ssh-config <file> [--node-script-sha256 <hex>] [options] (see the head of the file)"; }
 
 ACTION=${1:-}
 shift || true
-JOB_DIR="" AGENT="" MASTER_HOST="" HA_GROUP=cubrid HA_PORT_ID=59901 REPL_HOME="" BK_PATH="" RBK_PATH=""
+JOB_DIR="" SSH_CONFIG="" NODE_SHA="" MASTER_HOST="" HA_GROUP=cubrid HA_PORT_ID=59901 REPL_HOME="" BK_PATH="" RBK_PATH=""
 CONFIRM_RESTART=0 CONFIRM_OTHERS=0 CONFIRM_NEWDB=0 ROLLBACK_CONVERT=0 START_HA=1
 DBS_ARG=() NEW_SPEC=() EXIST_SPEC=() KEEP_ARG=()
 while [ $# -gt 0 ]; do
   case $1 in
     --job-dir) JOB_DIR=$2; shift 2 ;;
-    --agent) AGENT=$2; shift 2 ;;
+    --ssh-config) SSH_CONFIG=$2; shift 2 ;;
+    --node-script-sha256) NODE_SHA=$2; shift 2 ;;
     --master-host) MASTER_HOST=$2; shift 2 ;;
     --db) DBS_ARG+=("$2"); shift 2 ;;
     --confirm-master-restart) CONFIRM_RESTART=1; shift ;;
@@ -631,19 +196,8 @@ lock_block_fn() { case $LOCKED in "running $UUID "*) printf 'blocked %s\n' "$UUI
 
 # ------------------------------------------------ agent and remote execution
 
-AGENT_STARTED=0
-start_own_agent() {   # from a terminal: start the agent, which asks for the passwords
-  local specs=() s out
-  for s in "${EXIST_SPEC[@]}" "${NEW_SPEC[@]#*:}"; do specs+=("$s"); done
-  AGENT="$JOB_DIR/agent.$$.sock"
-  out=$("$CM_SSH" agent --socket "$AGENT" --log "$JOB_DIR/agent.log" --ask "${specs[@]}" </dev/tty) || return 1
-  AGENT_STARTED=1
-  "$CM_SSH" bind --agent "$AGENT" "$$" >/dev/null || return 1
-  log "ssh agent started (${out})"
-}
-
-declare -A NODE_LOCAL=() NODE_INFO=()
-OUT="" RC=0 LAST_ACTION="" TIMED_OUT=0 CANCEL_KILLED=0 NO_RESULT=0 MAY_HAVE_RUN=0 UNDO_FAILED=0
+declare -A NODE_LOCAL=() NODE_INFO=() N_CUBRID=()
+OUT="" RC=0 LAST_ACTION="" LAST_ARGS="" TIMED_OUT=0 CANCEL_KILLED=0 NO_RESULT=0 MAY_HAVE_RUN=0 CONN_LOST=0 UNDO_FAILED=0
 # Each command runs in the background so a cancel is noticed at once. interruptible: on cancel the client is
 # stopped (the agent then drops the transfer); otherwise the command is waited for, up to its limit.
 proc_alive() { local st; st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1; st=${st##*) }; [ "${st%% *}" != Z ]; }
@@ -687,38 +241,115 @@ run_bg() {   # run_bg <limit seconds> <interruptible 0|1> <command...> ; sets OU
   return $RC
 }
 
-# on_node <host> <limit> <interruptible> <action> [args...] : the node action's output in OUT, status in RC
+ssh_node() { ssh -F "$SSH_CONFIG" -T "$@"; }
+ssh_alive() { timeout 10 ssh -F "$SSH_CONFIG" -O check "$1" </dev/null >/dev/null 2>&1; }
+
+# the node's $CUBRID, read through its login shell (bash: .bash_profile, csh/tcsh: .cshrc); the command line stays
+# fixed ("sh -s"), the small reader comes on stdin
+discover_cubrid() {   # discover_cubrid <host> : sets N_CUBRID[host]; OUT has the reason when it fails
+  local out
+  out=$(timeout 60 ssh -F "$SSH_CONFIG" -T "$1" 'sh -s' 2>&1 <<'READ'
+s=$(getent passwd "$(id -un)" | cut -d: -f7)
+case $s in
+  */csh|*/tcsh) v=$("$s" -c 'echo "$CUBRID"' </dev/null 2>/dev/null) ;;
+  *) v=$(bash -l -c 'echo "$CUBRID"' </dev/null 2>/dev/null) ;;
+esac
+echo "@@CUBRID=$v"
+READ
+)
+  local v
+  v=$(printf '%s\n' "$out" | sed -n 's/^@@CUBRID=//p' | tail -1)
+  if [ -z "$v" ] || ! valid_path "$v"; then OUT=${v:-$(printf '%s\n' "$out" | grep -v '^$' | tail -1)}; return 1; fi
+  N_CUBRID[$1]=$v
+}
+
+# A call of the node script: on stdin a line with the number of arguments, then each argument ended by a NUL
+# ("--job" <uuid> <action> <args...>); for recv the file follows (FEED_DATA from byte FEED_FROM).
+FEED_DATA="" FEED_FROM=0
+write_call() {   # write_call <file> <action> [args...]
+  local f=$1
+  shift
+  { printf '%s\n' "$(( $# + 2 ))"; printf '%s\0' --job "$UUID" "$@"; } > "$f"
+}
+kill_tree() {   # kill_tree <pid> : the process and its children (a pipeline started in the background)
+  local c
+  for c in $(awk -v p="$1" '{ s=$0; sub(/.*\) /, "", s); split(s, f, " "); if (f[2] == p) { n=split(FILENAME, q, "/"); print q[3] } }' /proc/[0-9]*/stat 2>/dev/null); do
+    kill_tree "$c"
+  done
+  kill -KILL "$1" 2>/dev/null
+}
+
+# on_node <host> <limit> <interruptible> <action> [args...] : the node action's output in OUT, status in RC.
+# Flags for the caller: TIMED_OUT / CANCEL_KILLED (from run_bg), NO_RESULT (no @@END line), CONN_LOST (the host's
+# connection is gone), MAY_HAVE_RUN (no result although the command may have started).
 on_node() {
-  local host=$1 limit=$2 intr=$3
+  local host=$1 limit=$2 intr=$3 call feeder="" fifo=""
   shift 3
   LAST_ACTION="$host $1" LAST_ARGS="${*:2}"
-  # node actions start their daemons detached (setsid, own stdin/stdout), so the channel is not held open
   log "$host: $*"
-  if [ "${NODE_LOCAL[$host]:-0}" = 1 ]; then
-    run_bg "$limit" "$intr" bash "$SELF" node "$@"
-  else
-    local q="" a
-    for a in "$@"; do q+=" $(printf '%q' "$a")"; done
-    RUN_IN=$SELF run_bg "$limit" "$intr" "$CM_SSH" exec --agent "$AGENT" "$host" --stdin -- \
-      "f=\$(mktemp) && cat >\"\$f\" && bash -l \"\$f\" node$q </dev/null; rc=\$?; rm -f \"\$f\"; exit \$rc"
+  NO_RESULT=0 MAY_HAVE_RUN=0 CONN_LOST=0
+  call=$(mktemp "$JOB_DIR/call.XXXXXX")
+  write_call "$call" "$@"
+  local in=$call
+  if [ -n "$FEED_DATA" ]; then
+    # the call and then the data, through a FIFO so ssh (or bash) stays the direct child that run_bg stops
+    fifo="$call.fifo"; mkfifo -m 600 "$fifo"
+    { cat "$call"; tail -c +$(( FEED_FROM + 1 )) "$FEED_DATA"; } > "$fifo" 2>/dev/null &
+    feeder=$!
+    in=$fifo
   fi
+  if [ "${NODE_LOCAL[$host]:-0}" = 1 ]; then
+    RUN_IN=$in run_bg "$limit" "$intr" bash "$NODE_SCRIPT_L"
+  elif [ -z "${N_CUBRID[$host]:-}" ] && ! discover_cubrid "$host"; then
+    RC=255; TIMED_OUT=0; CANCEL_KILLED=0
+  elif ! ssh_alive "$host"; then
+    OUT="the connection to $host is gone"; RC=255; TIMED_OUT=0; CANCEL_KILLED=0
+  else
+    RUN_IN=$in run_bg "$limit" "$intr" ssh -F "$SSH_CONFIG" -T "$host" "${N_CUBRID[$host]}/share/cms/ha_node.sh"
+  fi
+  if [ -n "$feeder" ]; then kill_tree "$feeder"; wait "$feeder" 2>/dev/null; fi
+  rm -f "$call" "$fifo"
+  FEED_DATA="" FEED_FROM=0
   local full=$OUT body
   body=$(printf '%s\n' "$full" | awk '/^@@BEGIN$/ { on=1; next } /^@@END / { on=0; next } on')
   printf '%s\n' "$full" | sed 's/^/  /' >> "$LOG"
-  NO_RESULT=0 MAY_HAVE_RUN=0
   if [ "$TIMED_OUT" = 1 ] || [ "$CANCEL_KILLED" = 1 ]; then OUT=$body; return $RC; fi
   if ! printf '%s\n' "$full" | grep -q '^@@END '; then
-    OUT=$(printf '%s' "$full" | grep '^cm_ssh: ' | tail -1)
-    [ -n "$OUT" ] || OUT="no result from $host"
     NO_RESULT=1
-    # the command may have run when the connection broke during it (or nothing came back at all);
-    # a failed login or channel means it never started
-    case $OUT in *"while the command ran"*|"no result from "*) MAY_HAVE_RUN=1 ;; esac
-    RC=255
-    return 255
+    OUT=$(printf '%s\n' "$full" | grep -v '^[[:space:]]*$' | tail -1)
+    [ -n "$OUT" ] || OUT="no result from $host"
+    if [ "${NODE_LOCAL[$host]:-0}" = 1 ]; then MAY_HAVE_RUN=1
+    elif ! ssh_alive "$host"; then
+      # 255 and no result and the master is gone: the connection broke (the command may have started)
+      CONN_LOST=1; MAY_HAVE_RUN=1; OUT="the connection to $host broke: $OUT"
+    else
+      # some other ssh failure (a session refused, ...): the command may still have started
+      MAY_HAVE_RUN=1; OUT="ssh to $host failed: $OUT"
+    fi
+    [ "$RC" -eq 0 ] && RC=255
+    return "$RC"
   fi
   OUT=$body
-  return "$RC"
+  RC=$(printf '%s\n' "$full" | sed -n 's/^@@END \([0-9]*\).*/\1/p' | tail -1)
+  return "${RC:-1}"
+}
+
+# send_file <host> <local file> <remote file> : through the node's recv (size and sha256 compared there); a broken
+# transfer continues from what arrived, up to 3 times while the connection is there
+send_file() {
+  local h=$1 f=$2 dst=$3 size sum try off=0 mode=()
+  size=$(wc -c < "$f" | tr -d ' '); sum=$(sha256sum "$f" | cut -d' ' -f1)
+  for try in 1 2 3; do
+    FEED_DATA=$f FEED_FROM=$off
+    on_node "$h" 21600 1 recv "$dst" "$size" "$sum" "${mode[@]}" && return 0
+    [ "$CANCEL_KILLED" = 1 ] && return 130
+    { [ "$TIMED_OUT" = 1 ] || [ "$CONN_LOST" = 1 ]; } && return 1
+    on_node "$h" 60 0 recv_size "$dst" || return 1
+    off=$(printf '%s\n' "$OUT" | sed -n 's/^SIZE //p'); off=${off:-0}
+    if [ "$off" -gt 0 ] && [ "$off" -lt "$size" ]; then mode=(--append); else off=0 mode=(); fi
+    log "$h: transfer of $f continues from byte $off"
+  done
+  return 1
 }
 
 kv() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
@@ -896,7 +527,8 @@ st_precheck() {
       *) PK_STATUS[$db]=not_logged_in; WARN+=("$db: primary keys not checked (not logged in)") ;;
     esac
   done
-  BK_PATH=${BK_PATH:-$CUBRID_DATABASES/ha_add_nodes_backup}
+  BK_PATH=${BK_PATH:-$CUBRID_DATABASES}; BK_PATH=${BK_PATH%/}; [[ $BK_PATH == */ha_add_nodes_backup ]] || BK_PATH+=/ha_add_nodes_backup
+  [ "$LOCAL_STATE" = single ] || check_ha_values || return 1
   # backup room here: the size of the databases' volumes
   local need=0 free sz
   for db in "${D[@]}"; do sz=$(du -sk "${DB_VOL[$db]}" 2>/dev/null | awk '{ print $1 * 1024 }'); need=$(( need + ${sz:-0} )); done
@@ -907,6 +539,16 @@ st_precheck() {
   for i in "${!NEW_HOST[@]}"; do NODE_LOCAL[${NEW_HOST[$i]}]=0; done
   log "this server: $L ($LOCAL_STATE), CUBRID $VERSION, databases ${D[*]}, case $CASE_NO"
   return 0
+}
+
+# the HA settings copied to the new nodes have to pass the node script's value check (letters, digits, @:,._/-)
+check_ha_values() {
+  local k v bad=""
+  while IFS=$'\t' read -r k v; do
+    [ -n "$k" ] || continue
+    [[ $k =~ ^[a-z_]+$ && $v =~ ^[A-Za-z0-9@:,._/-]*$ ]] || bad+="$k=$v "
+  done < <(conf_pairs "$CUBRID/conf/cubrid_ha.conf" "[common]")
+  [ -z "$bad" ] || { fail precheck_failed "cubrid_ha.conf has values the node script does not take: $bad"; return 1; }
 }
 
 # ------------------------------------------------ S2 node checks
@@ -922,11 +564,59 @@ node_path() {   # node_path <host> <path>
     *) printf '%s' "$p" ;;
   esac
 }
-rbk_root() { printf '%s' "${RBK_PATH:-${N_CUBDB[$1]}/ha_add_nodes_backup}"; }
+rbk_root() { local b=${RBK_PATH:-${N_CUBDB[$1]}}; b=${b%/}; [[ $b == */ha_add_nodes_backup ]] || b+=/ha_add_nodes_backup; printf '%s' "$b"; }
 all_names() { printf '%s ' "$L" "${EX_HOST[@]}" "${NEW_HOST[@]}"; }
+
+# node_login_check <host>: the shell first, then $CUBRID, then the node script (missing, other version, changed,
+# loosely owned), each with its own error code
+node_login_check() {
+  local h=$1 out rc
+  ssh_alive "$h" || { fail connection_lost "$h: no connection (the manager's login to it is gone)"; return 1; }
+  out=$(timeout 60 ssh -F "$SSH_CONFIG" -T "$h" true 2>&1 </dev/null); rc=$?
+  if [ $rc -ne 0 ]; then
+    case $out in
+      *"currently not available"*) fail account_no_shell "$h: the account's login shell does not allow a login ($(one_line "$out"))" ;;
+      *) if [ $rc -eq 126 ] || [ $rc -eq 127 ]; then fail remote_shell_failed "$h: the account's login shell cannot run a command ($rc)"
+         elif [ $rc -eq 255 ] && ! ssh_alive "$h"; then fail connection_lost "$h: the connection broke"
+         else fail ssh_failed "$h: $(one_line "$out" | tail -c 200)"
+         fi ;;
+    esac
+    return 1
+  fi
+  discover_cubrid "$h" || { fail cubrid_not_found "$h: CUBRID was not found for this account ($(one_line "$OUT"))"; return 1; }
+  on_node "$h" 60 0 version
+  if [ "$NO_RESULT" = 1 ]; then
+    if [ "$RC" = 127 ] || [[ $OUT == *"No such file"* ]]; then
+      fail node_script_missing "$h: ${N_CUBRID[$h]}/share/cms/ha_node.sh is missing (the CUBRID package with the manager is needed)"
+    elif [ "$CONN_LOST" = 1 ]; then fail connection_lost "$h: $OUT"
+    else fail ssh_failed "$h: $OUT"
+    fi
+    return 1
+  fi
+  local v=$OUT sv sh sv_l me
+  sv=$(kv "$v" SCRIPT_VERSION); sh=$(kv "$v" SELF_SHA256); me=$(kv "$v" ME)
+  sv_l=$(sed -n 's/^SCRIPT_VERSION=//p' "$NODE_SCRIPT_L" | head -1)
+  if [ -n "$NODE_SHA" ] && [ "$sh" != "$NODE_SHA" ]; then
+    if [ "$sv" != "$sv_l" ]; then fail node_script_version_mismatch "$h: its node script is version $sv, this server's $sv_l"
+    else fail node_script_tampered "$h: its node script differs from the package's (sha256 $sh)"
+    fi
+    return 1
+  fi
+  # the file and every folder up to / : owned by the account or root, no group or other write
+  local owner mode path bad=""
+  while read -r _ owner mode path; do
+    [ -n "$path" ] || continue
+    if { [ "$owner" != "$me" ] && [ "$owner" != root ]; } || (( (8#${mode: -2:1} & 2) || (8#${mode: -1} & 2) )); then
+      bad+="$path ($owner $mode) "
+    fi
+  done < <(printf '%s\n' "$v" | grep '^OWNER ')
+  [ -z "$bad" ] || { fail node_script_unsafe "$h: others can change the node script: $bad"; return 1; }
+  return 0
+}
 
 st_node_check() {   # st_node_check <host> <existing|new> <role>
   local h=$1 kind=$2 role=$3 db
+  if [ "${NODE_LOCAL[$h]:-0}" != 1 ]; then node_login_check "$h" || return 1; fi
   if ! on_node "$h" 60 0 info; then
     local code
     code=$(sed -n 's/^cm_ssh: \([a-z_]*\):.*/\1/p' <<< "$OUT")
@@ -1009,6 +699,32 @@ st_node_check() {   # st_node_check <host> <existing|new> <role>
 
 # each failure also goes to the job folder as "node<TAB>path<TAB>reason<TAB>detail" (preflight_failures in the status;
 # reason: not_writable, no_room, cannot_create, transfer_failed) so the screen does not have to parse the message
+# node_checks: "node<TAB>code<TAB>message<TAB>action" per node (the manager writes the login results, S2 replaces
+# the node's row)
+action_for() {
+  case $1 in
+    ok) echo "" ;;
+    connection_lost) echo "Check the network and the node, then run again with the passwords" ;;
+    ssh_failed) echo "Check the ssh message and the node's sshd settings" ;;
+    account_no_shell|remote_shell_failed) echo "Check the account's login shell on the node" ;;
+    cubrid_not_found) echo "Give the account that has CUBRID installed" ;;
+    node_script_missing) echo "Install the CUBRID package with the manager on the node" ;;
+    node_script_version_mismatch|version_mismatch) echo "Install the same CUBRID version on every node" ;;
+    node_script_tampered) echo "Put back the packaged ha_node.sh and find out who changed it" ;;
+    node_script_unsafe) echo "Remove group and other write permission from the node script and its folders" ;;
+    new_node_in_ha) echo "Use a server without HA settings as a new node" ;;
+    db_path_conflict) echo "Give the database a folder of its own" ;;
+    port_mismatch) echo "Use the same cubrid_port_id on every node" ;;
+    slave_db_running) echo "Stop the database on the new node" ;;
+    *) echo "See the message" ;;
+  esac
+}
+nc_set() {   # nc_set <node> <code> <message>
+  local f="$JOB_DIR/node_checks" tmp="$JOB_DIR/node_checks.tmp" line
+  line="$1"$'\t'"$2"$'\t'"$(one_line "$3")"$'\t'"$(action_for "$2")"
+  { [ -f "$f" ] && awk -F'\t' -v n="$1" '$1 != n' "$f"; printf '%s\n' "$line"; } > "$tmp" && mv -f "$tmp" "$f"
+}
+
 pf_note() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(one_line "$4")" >> "$JOB_DIR/preflight_failures"; }
 
 st_preflight() {   # <host>: L tries its backup folder; a new node its receiving folder (a small transfer),
@@ -1064,13 +780,16 @@ st_preflight() {   # <host>: L tries its backup folder; a new node its receiving
     fail transfer_failed "$h: cannot create $t"
     return 1
   fi
-  run_bg 120 1 "$CM_SSH" put --agent "$AGENT" "$h" "$SELF" "$t/transfer-test"
-  local prc=$RC pout=$OUT
+  local tf="$JOB_DIR/transfer-test"
+  head -c 65536 /dev/urandom > "$tf" 2>/dev/null || : > "$tf"
+  send_file "$h" "$tf" "$t/transfer-test"
+  local prc=$? pout=$OUT
+  rm -f "$tf"
   on_node "$h" 30 0 remove "$t"
   [ $made = 1 ] && on_node "$h" 30 0 rmdir_empty "$r"
   if [ "$prc" -ne 0 ]; then
-    pf_note "$h" "$t" transfer_failed "$(printf '%s' "$pout" | grep '^cm_ssh: ' | tail -1)"
-    fail transfer_failed "$h: a test transfer failed: $(printf '%s' "$pout" | grep '^cm_ssh: ' | tail -1)"
+    pf_note "$h" "$t" transfer_failed "$(one_line "$pout")"
+    fail transfer_failed "$h: a test transfer failed: $(one_line "$pout")"
     return 1
   fi
   return 0
@@ -1212,10 +931,8 @@ st_backup() {   # <no> <db>
     PARENT_RECORDED[$L]=1
   fi
   undo_add "$no" "$L" remove "$dir"
-  mkdir -p "$dir" || { fail command_failed "cannot create $dir"; return 1; }
-  chmod 700 "$BK_PATH/$TAG"
-  on_node "$L" 21600 0 cubrid backupdb -C -D "$dir" -o "$dir/backup.out" --no-check "$db@localhost" \
-    || { fail command_failed "cubrid backupdb $db failed ($RC)"; return 1; }
+  mkdir -p "$BK_PATH/$TAG" && chmod 700 "$BK_PATH/$TAG" || { fail command_failed "cannot create $BK_PATH/$TAG"; return 1; }
+  on_node "$L" 21600 0 backup "$db" "$dir" || { fail command_failed "cubrid backupdb $db failed ($RC): $(one_line "$OUT" | tail -c 300)"; return 1; }
 }
 
 st_send_backup() {   # <no> <host> <db>
@@ -1231,11 +948,12 @@ st_send_backup() {   # <no> <host> <db>
   for f in "$src"/* "${DB_LOG[$db]}/${db}_bkvinf"; do
     [ -f "$f" ] || continue
     [ "$(basename "$f")" = backup.out ] && continue
-    log "$h: put $f"
-    LAST_ACTION="$h put"
-    run_bg 21600 1 "$CM_SSH" put --agent "$AGENT" "$h" "$f" "$dst/$(basename "$f")"
-    printf '%s\n' "$OUT" | grep -v '^progress [0-9]' | sed 's/^/  /' >> "$LOG"
-    [ "$RC" -eq 0 ] || { [ "$CANCEL_KILLED" = 1 ] && { fail cancelled cancelled; return 1; }; fail transfer_failed "$h: $(printf '%s' "$OUT" | grep '^cm_ssh: ' | tail -1)"; return 1; }
+    send_file "$h" "$f" "$dst/$(basename "$f")"
+    case $? in
+      0) ;;
+      130) fail cancelled cancelled; return 1 ;;
+      *) fail transfer_failed "$h: sending $(basename "$f") failed: $(one_line "$OUT")"; return 1 ;;
+    esac
   done
 }
 
@@ -1244,7 +962,7 @@ st_keep_old() {   # <no> <host> <db>
   local no=$1 h=$2 db=$3 l kind p
   local peers=() x
   for x in $(list_hosts "$(final_node_list)"); do [ "$x" = "$h" ] || peers+=("$x"); done
-  on_node "$h" 600 0 keep_old ".ha_add_nodes_$TAG" "$db" "${NV[$h/$db]}" "${NLG[$h/$db]}" "${N_HOME[$h]}" "${peers[@]}"
+  on_node "$h" 600 0 keep_old "$db" "${peers[@]}"
   local rc=$RC
   while read -r kind p; do
     case $kind in
@@ -1265,14 +983,14 @@ st_restore() {   # <no> <host> <db>
   # what restoreslave writes goes into folders keep_old created or found empty: the undo clears just those
   local how p
   while read -r how p; do [ -n "$p" ] && undo_add "$no" "$h" clear "$how" "$p"; done <<< "${CLEAR_AT_RESTORE[$h/$db]:-}"
-  on_node "$h" 21600 0 restore "$db" "$dst" "${NLG[$h/$db]}" "$MASTER_HOST" "$SRC_STATE" \
+  on_node "$h" 21600 0 restore "$db" "$dst" "$MASTER_HOST" "$SRC_STATE" \
     || { fail command_failed "$h: cubrid restoreslave $db failed ($RC): $(one_line "$OUT" | tail -c 300)"; return 1; }
 }
 
 st_first_copylog() {   # <no> <host> <db>
   local no=$1 h=$2 db=$3 dir="${N_HOME[$2]}/$3_$MASTER_HOST"
   undo_add "$no" "$h" remove "$dir"
-  on_node "$h" 3600 0 first_copylog "$db" "$MASTER_HOST" "$dir" \
+  on_node "$h" 3600 0 first_copylog "$db" "$MASTER_HOST" \
     || { fail command_failed "$h: copylogdb $db failed ($RC): $(one_line "$OUT" | tail -c 300)"; return 1; }
 }
 
@@ -1749,12 +1467,20 @@ write_plan() {
 
 # ------------------------------------------------ main
 
+close_masters() {   # the job's ssh connections, one per node (the watcher closes them too; this covers a lost watcher)
+  [ -f "$SSH_CONFIG" ] || return 0
+  local h
+  for h in $(awk '$1 == "Host" { for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) print $i }' "$SSH_CONFIG"); do
+    timeout 10 ssh -F "$SSH_CONFIG" -O exit "$h" </dev/null >/dev/null 2>&1
+  done
+}
+
 finish() {   # finish <status>
   JOB[status]=$1; JOB[phase]=done; JOB[ended_at]=$(epoch); JOB[detail]=""
   job_write
   # rollback_blocked keeps the lock (a command may still run on a node) until this job is rolled back
   if [ "$1" = rollback_blocked ]; then lock_edit lock_block_fn; else lock_edit lock_free_fn; fi
-  [ -n "$AGENT" ] && "$CM_SSH" quit --agent "$AGENT" >/dev/null 2>&1
+  close_masters
   log "job ends: $1"
   exit 0
 }
@@ -1777,16 +1503,10 @@ log "$PROG $ACTION (job $UUID)"
 if ! lock_edit lock_take_fn; then
   JOB[error]=busy; JOB[message]="another job holds the lock (roll back a stopped job first): $LOCKED"; job_write
   JOB[status]=fail; JOB[phase]=done; job_write
-  [ -n "$AGENT" ] && "$CM_SSH" quit --agent "$AGENT" >/dev/null 2>&1
   exit 1
 fi
-# the agent ends by itself once this process is gone
-[ -n "$AGENT" ] && "$CM_SSH" bind --agent "$AGENT" "$$" >/dev/null 2>&1
-if [ -z "$AGENT" ]; then
-  if [ -t 0 ]; then start_own_agent || { JOB[error]=no_agent; JOB[message]="cannot start the ssh agent"; finish fail; }
-  else JOB[error]=no_agent; JOB[message]="no --agent given"; finish fail
-  fi
-fi
+if [ -z "$SSH_CONFIG" ] || [ ! -f "$SSH_CONFIG" ]; then JOB[error]=no_ssh_config; JOB[message]="no --ssh-config (the manager logs in to the nodes first)"; finish fail; fi
+[ -f "$NODE_SCRIPT_L" ] || { JOB[error]=node_script_missing; JOB[message]="$NODE_SCRIPT_L is missing"; finish fail; }
 
 if ! parse_inputs; then JOB[error]=$FAIL_CODE; JOB[message]=$FAIL_MSG; finish fail; fi
 
@@ -1847,7 +1567,11 @@ JOB[case]=$CASE_NO; JOB[db_names]="${D[*]}"; job_write
 for i in "${!S_ID[@]}"; do
   case ${S_ID[$i]} in node_check|preflight) ;; *) continue ;; esac
   step_set "$i" running
-  if run_step "$i"; then step_set "$i" done; else
+  if run_step "$i"; then
+    step_set "$i" done
+    [ "${S_ID[$i]}" = node_check ] && nc_set "${S_NODE[$i]}" ok ""
+  else
+    [ -n "${S_NODE[$i]}" ] && nc_set "${S_NODE[$i]}" "$FAIL_CODE" "$FAIL_MSG"
     step_set "$i" failed "$FAIL_MSG"
     JOB[error]=$FAIL_CODE; JOB[message]=$FAIL_MSG; finish fail
   fi
@@ -1892,12 +1616,19 @@ for i in "${!S_ID[@]}"; do
     else FAIL_CODE=no_answer; FAIL_MSG="no answer in time from ${LAST_ACTION%% *} (${LAST_ACTION#* }), taken as a lost connection: $FAIL_MSG"
     fi
   elif [ "$NO_RESULT" = 1 ] && [ "$MAY_HAVE_RUN" = 1 ] && may_still_run "${LAST_ACTION#* }"; then
-    FAIL_CODE=connection_lost
+    # a lost connection, or another ssh failure, under a command that may still run there (V6): blocked
+    FAIL_CODE=connection_lost; [ "$CONN_LOST" = 1 ] || FAIL_CODE=ssh_failed
+    STOP_BLOCKED=1
     JOB[lost_nodes]="${LAST_ACTION%% *}"; JOB[lost_actions]="${LAST_ACTION} ${LAST_ARGS};"
-    FAIL_MSG="the connection to ${LAST_ACTION%% *} broke while ${LAST_ACTION#* } ran; it may still be running there: $FAIL_MSG"
+    FAIL_MSG="no result from ${LAST_ACTION%% *} while ${LAST_ACTION#* } ran; it may still be running there: $FAIL_MSG"
+  elif [ "$NO_RESULT" = 1 ]; then
+    # a quick command: rolled back; a node whose connection is gone keeps its lines for a later rollback
+    if [ "$CONN_LOST" = 1 ]; then FAIL_CODE=connection_lost; JOB[lost_nodes]="${LAST_ACTION%% *}"; JOB[lost_actions]="${LAST_ACTION} ${LAST_ARGS};"
+    else FAIL_CODE=ssh_failed
+    fi
   fi
   [ "$UNDO_FAILED" = 1 ] && { FAIL_CODE=undo_write_failed; FAIL_MSG="cannot write the undo log $UNDO: $FAIL_MSG"; }
-  case $FAIL_CODE in no_response|connection_lost|undo_write_failed|master_changed) ;; *)
+  case $FAIL_CODE in no_response|connection_lost|ssh_failed|undo_write_failed|master_changed) ;; *)
     [ "$CANCEL" = 1 ] && { FAIL_CODE=cancelled; FAIL_MSG="cancelled during ${S_ID[$i]}${FAIL_MSG:+ ($FAIL_MSG)}"; } ;;
   esac
   step_set "$i" failed "$FAIL_MSG"
@@ -1912,7 +1643,7 @@ if [ "$failed_at" -lt 0 ]; then
 fi
 
 JOB[error]=$FAIL_CODE; JOB[message]=$FAIL_MSG; job_write
-if [ "$FAIL_CODE" = no_response ] || [ "$FAIL_CODE" = connection_lost ]; then
+if [ "$FAIL_CODE" = no_response ] || [ "${STOP_BLOCKED:-0}" = 1 ]; then
   # a command did not come back and may still run: nothing is undone on top of it; the user checks the node
   # and calls rollback (the lock stays until then)
   finish rollback_blocked
@@ -1926,3 +1657,4 @@ fi
 [ -n "$RB_NOTE" ] && JOB[message]="$FAIL_MSG; $RB_NOTE"
 [ $rb = 2 ] && finish rollback_blocked
 finish rollback_failed
+}
