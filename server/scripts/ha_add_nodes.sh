@@ -1294,6 +1294,8 @@ if ! lock_edit lock_take_fn; then
   [ -n "$AGENT" ] && "$CM_SSH" quit --agent "$AGENT" >/dev/null 2>&1
   exit 1
 fi
+# the agent ends by itself once this process is gone
+[ -n "$AGENT" ] && "$CM_SSH" bind --agent "$AGENT" "$$" >/dev/null 2>&1
 if [ -z "$AGENT" ]; then
   if [ -t 0 ]; then start_own_agent || { JOB[error]=no_agent; JOB[message]="cannot start the ssh agent"; finish fail; }
   else JOB[error]=no_agent; JOB[message]="no --agent given"; finish fail
