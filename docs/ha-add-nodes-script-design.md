@@ -270,7 +270,7 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 | B 승격(싱글만) | S4 | `convert_stop` | 1 | SC @L | 떠 있는 DB 전부 `cubrid server stop` | S3 | 처음에 떠 있던 DB를 싱글로 기동 |
 | | S5 | `convert_config` | 1 | SC @L | cubrid.conf `ha_mode=on`·`[@db] ha_mode=off`, cubrid_ha.conf(노드 1개), databases.txt | S4 | `.bak` 복원 |
 | | S6 | `convert_restart` | 1 | SC @L | `cub_commdb -A` → `cubrid heartbeat start` | S5 | heartbeat 멈춤, cub_master 내림 |
-| | S7 | `convert_verify` | 1 | SC @L | D 모두 active(최대 180초) | S6 | 없음 |
+| | S7 | `convert_verify` | 1 | SC @L | D 모두 active(시작부터 180초까지, 조회 시간 포함) | S6 | 없음 |
 | | S8 | `convert_start_others` | 1 | SC @L | 고르지 않았던 DB를 싱글로 다시 기동 | S7 | 그 DB 멈춤 |
 | C 백업·전송 | S9 | `backup [D]` | DB | SC @L | `cubrid backupdb -C --no-check <D>@localhost`(DB마다 한 번) | S3(승격이 있으면 S8) | 백업 폴더 지움 |
 | | S10 | `send_backup [X/Y, D]` | DB×노드 | SC → H(SFTP) | 백업 파일 + bkvinf 올림, 크기·sha256 확인 | S9 전부 | 받은 폴더 지움 |
@@ -404,7 +404,9 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 | S4~S8 승격, S15·S16 HA 시작, S17·S18 등록 | 그 단계의 명령이 끝난 뒤 | 반쯤 바뀐 HA 상태를 남기지 않게 |
 | 그 밖 | 다음 단계로 넘어가기 전 | |
 
-- "끝난 뒤" 단계의 최대 대기: 그 명령의 단계 제한 시간(S9·S13 기본 6시간, S14 1시간, 그 밖 10분, 인자로 바꿀 수 있음)을 넘으면 기다림을 멈추고 상태에 "원격 명령 응답 없음(<노드> <명령>)"을 남긴 채 되돌리기를 하지 않고 멈춤(`job_status`=`rollback_blocked`). 사용자가 그 노드를 확인한 뒤 `rollback`을 다시 부름. 응답 없는 명령 위에 되돌리기를 겹치지 않기 위함임.
+- "끝난 뒤" 단계의 최대 대기: 그 명령의 단계 제한 시간(S9·S13 기본 6시간, S14 1시간, 그 밖 10분, 인자로 바꿀 수 있음)을 넘으면 기다림을 멈추고 상태에 "원격 명령 응답 없음(<노드> <명령>)"을 남긴 채 되돌리기를 하지 않고 멈춤(`job_status`=`rollback_blocked`). 사용자가 그 노드를 확인한 뒤 `rollback`을 다시 부름. 아직 돌고 있을 수 있는 명령 위에 되돌리기를 겹치지 않기 위함임.
+- 시간 초과의 판단은 명령 종류로 나눔(실패 목록표 2.1·2.6). 오래 걸리거나 CUBRID 프로세스를 띄우고 내리는 명령(restoreslave, 첫 copylogdb, backupdb, heartbeat·server·cub_master, `reload`, `repl`)만 위와 같이 `rollback_blocked`로 멈춤. 파일·폴더 고치기와 조회는 노드에서 바로 끝나므로, 답이 없으면 연결이 끊긴 것으로 보고(`error`=`unreachable`) 되돌림. 망이 패킷을 버리는 끊김은 헬퍼가 알아차리지 못하고 제한 시간으로만 드러나기 때문임.
+- 시간 초과로 명령을 끝낼 때는 KILL을 보냄(되돌리기 중 무시하는 TERM은 띄운 명령에도 무시된 채 물려감).
 - 되돌리기 중에는 TERM을 무시함(되돌리기 명령은 취소되지 않음).
 - 기다리는 명령은 백그라운드로 띄우고 `wait`함. 그래야 trap이 바로 돌아 "취소 대기" 상태를 남길 수 있음.
 
@@ -414,7 +416,12 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 - 백업 파일 이름은 `<파일>.bak.<uuid>.<단계 순번>`임. 한 작업에서 같은 파일을 두 번 고쳐도(케이스 1·2에서 L의 cubrid_ha.conf·databases.txt는 S5와 S17에서 바뀜) 백업이 겹치지 않음. 그래서 거꾸로 되돌리면 싱글 시절 파일까지 돌아감.
 - 지우는 되돌리기는 경로째 지우지 않음. 그 단계가 만든 파일·폴더만 지움. 예: S12가 반만 옮긴 상태에서 S13 되돌리기가 남은 옛 파일까지 지우는 일이 없음(S13은 S12가 만들었거나 비어 있던 폴더만 비움).
 - 되돌린 줄은 `done <번호>`를 덧붙여 적음. `rollback`을 다시 돌리면 끝난 줄은 건너뜀.
-- 접속이 안 되는 노드의 줄은 건너뛰고 계속 감. 끝에 "되돌리지 못한 항목"(노드, 종류, 경로)으로 상태에 남김.
+- 접속이 안 되는 노드의 줄은 건너뛰고 계속 감. 한 노드의 되돌리기가 제한 시간이나 헬퍼 오류로 실패하면 그 노드의 남은 줄은 이번에는 시도하지 않음. 끝에 "되돌리지 못한 항목"(노드, 종류, 경로)으로 상태에 남김.
+- `server_start <DB>`(새 노드·L의 다른 DB를 다시 띄우기)는 떠 있지 않은 DB만 띄움. 기록은 설정 복원보다 뒤에 돌도록 S11(S4)에 남기는데, S15 전에 실패하면 그 DB는 아직 떠 있기 때문임.
+- 새 노드에서 작업이 만든 폴더
+  - S12가 만든 DB 볼륨·로그 폴더(없던 상위 폴더 포함): 만든 즉시 `rmdir_empty`를 기록함. 그 DB의 S13 전에 실패·취소해도 빈 폴더가 남지 않음. S13이 시작되면 S13 기록이 먼저 그 안을 비움
+  - S15 heartbeat start가 만드는 복제 로그 폴더(`<복제 로그 위치>/<DB>_<다른 노드>`): heartbeat start 전에 없던 것을 기록해 heartbeat stop 뒤 지움. S12가 같은 이름의 옛 폴더를 옮겨 두므로 없던 것은 이 작업의 것임
+- `rollback` 동작(중단·막힌 작업 되돌리기)은 원래 작업의 단계 표를 읽어 단계마다 `rolled_back`·`rollback_failed`를 표시함. 끊길 때 돌던 단계는 `failed`(interrupted)로 바꿈.
 
 ## 10. CMS API
 
@@ -475,7 +482,7 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 
 | 항목 | 왜 |
 |---|---|
-| a ≥ 2일 때 새 노드끼리의 copylogdb가 heartbeat start만으로 뜨고 붙는지 | S16 필요 여부 |
+| a ≥ 2일 때 새 노드끼리의 copylogdb가 heartbeat start만으로 뜨고 붙는지 | S16 필요 여부. 결과(새 슬레이브 2대를 한 번에 추가한 시험): heartbeat start만으로 새 노드끼리 서로의 로그를 복사했고 S16은 할 일이 없었음. S16은 빠진 것이 있을 때만 띄우는 단계로 그대로 둠 |
 | 새 레플리카: 기존 노드 reload만으로 붙는지, 모든 슬레이브의 로그를 받는지, failover 뒤에도 데이터가 이어지는지 | 2.1 표 |
 | `repl start <레플리카>`가 실제로 "not listed"로 거부되는지 | 소스 확인만 함 |
 | N, M이 클 때(노드 9대 이상 포함) heartbeat·복제가 정상인지 | 노드 수 상한 |
