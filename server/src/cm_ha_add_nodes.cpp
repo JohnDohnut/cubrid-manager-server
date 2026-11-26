@@ -298,18 +298,53 @@ namespace
   /* ------------------------------------------------------------ the job lock (shared with the script) */
 
   /* "starting <uuid> <epoch>" or "running <uuid> <pid> <pid start>"; free when the holder is gone */
-  bool lock_in_use (const string &content)
+  std::map<string, string> key_values (const string &text);
+  string state_of (const string &dir, const string &name);
+  bool valid_uuid (const string &u);
+  string jobs_root ();
+
+  /*
+   * running: held while the script lives, and after it died without finishing (interrupted) until that job is rolled
+   * back (a plan or cleanup changes nothing and does not hold it). blocked: a job that stopped with rollback_blocked,
+   * held until it is rolled back. The job's own rollback (me) passes.
+   */
+  bool lock_in_use (const string &content, const string &me, string *why)
   {
     std::istringstream in (content);
     string what, uuid, a, b;
     in >> what >> uuid >> a >> b;
+    if (!uuid.empty () && uuid == me)
+      {
+	return false;
+      }
     if (what == "running")
       {
-	return proc_start ((pid_t) atoi (a.c_str ())) == b && !b.empty ();
+	if (proc_start ((pid_t) atoi (a.c_str ())) == b && !b.empty ())
+	  {
+	    *why = "job " + uuid + " is running";
+	    return true;
+	  }
+	if (!valid_uuid (uuid))
+	  {
+	    return false;
+	  }
+	std::map<string, string> job = key_values (state_of (jobs_root () + "/" + uuid, "job"));
+	if (job["status"] == "running" && job["action"] != "plan" && job["action"] != "cleanup")
+	  {
+	    *why = "job " + uuid + " stopped without finishing (interrupted); roll it back first";
+	    return true;
+	  }
+	return false;
       }
-    if (what == "starting")
+    if (what == "blocked")
       {
-	return time (NULL) - atol (a.c_str ()) < 60;
+	*why = "job " + uuid + " stopped with rollback_blocked; roll it back first";
+	return true;
+      }
+    if (what == "starting" && time (NULL) - atol (a.c_str ()) < 60)
+      {
+	*why = "a job is starting";
+	return true;
       }
     return false;
   }
@@ -336,6 +371,7 @@ namespace
    * reserve the lock for a new job; the script turns it into "running" when it starts.
    * 0: reserved, 1: another job holds it (*holder), -1: the lock file cannot be used (*holder)
    */
+  string g_lock_prev;
   int lock_reserve (const string &uuid, string *holder)
   {
     string path = jobs_root () + "/lock";
@@ -346,18 +382,19 @@ namespace
 	return -1;
       }
     flock (fd, LOCK_EX);
-    string content;
+    string content, why;
     read_file (path, &content);
-    bool ok = !lock_in_use (content);
+    bool ok = !lock_in_use (content, uuid, &why);
     if (ok)
       {
+	g_lock_prev = content;	/* this job's own blocked/interrupted mark comes back if it cannot start */
 	string line = "starting " + uuid + " " + std::to_string ((long) time (NULL)) + "\n";
 	ftruncate (fd, 0);
 	pwrite (fd, line.data (), line.size (), 0);
       }
     else
       {
-	*holder = trim (content);
+	*holder = why;
       }
     flock (fd, LOCK_UN);
     close (fd);
@@ -378,6 +415,13 @@ namespace
     if (content.compare (0, 9 + uuid.size (), "starting " + uuid) == 0)
       {
 	ftruncate (fd, 0);
+	std::istringstream prev (g_lock_prev);
+	string w, u;
+	prev >> w >> u;
+	if (u == uuid && (w == "blocked" || w == "running"))
+	  {
+	    pwrite (fd, g_lock_prev.data (), g_lock_prev.size (), 0);
+	  }
       }
     flock (fd, LOCK_UN);
     close (fd);
@@ -1078,7 +1122,7 @@ ext_ha_add_nodes (Json::Value &request, Json::Value &response)
   int lr = lock_reserve (uuid, &why);
   if (lr != 0)
     {
-      return give_up (lr > 0 ? "another job is running: " + why : why);
+      return give_up (lr > 0 ? "busy: " + why : why);
     }
   if (action == "plan" || action == "run")
     {
@@ -1290,9 +1334,10 @@ ext_ha_add_nodes_status (Json::Value &request, Json::Value &response)
 	}
       steps.append (s);
     }
-  if (cur == 0 && status == "running" && first_pending > 0)
+  if (cur == 0 && status == "running" && !steps.empty ())
     {
-      cur = first_pending;	/* between two steps: the one that comes next */
+      /* between two steps: the one that comes next (after the last one: the last one) */
+      cur = first_pending > 0 ? first_pending : (int) steps.size ();
     }
   response["steps"] = steps;
   response["step_count"] = (int) steps.size ();

@@ -216,6 +216,10 @@ node_info() {
   if cub_master_running; then echo "CUB_MASTER=yes"; else echo "CUB_MASTER=no"; fi
   echo "SERVERS=$(cubrid server status 2>/dev/null </dev/null | awk '$1 == "Server" || $1 == "HA-Server" { print $2 }' | tr '\n' ' ')"
   echo "DBTXT=$(awk '$1 !~ /^#/ && NF >= 4 { print $1 }' "$CUBRID_DATABASES/databases.txt" 2>/dev/null | tr '\n' ' ')"
+  # name:volume:log of every registered database (S2 refuses paths that overlap another database's)
+  echo "DBPATHS=$(awk '$1 !~ /^#/ && NF >= 4 { print $1 ":" $2 ":" $4 }' "$CUBRID_DATABASES/databases.txt" 2>/dev/null | tr '\n' ' ')"
+  if timeout 15 cubrid heartbeat status </dev/null 2>/dev/null | grep -q "HA-Node Info"; then echo "HEARTBEAT=yes"; else echo "HEARTBEAT=no"; fi
+  echo "CUBRID_PORT_ID=$(conf_get "$CUBRID/conf/cubrid.conf" "[common]" cubrid_port_id)"
 }
 
 # the nearest folder of a path that exists (the path itself when it exists)
@@ -323,22 +327,34 @@ node_repl() {   # node repl <start|stop> <node> : success only when the output h
   [ $rc -eq 0 ] && [[ $out != *": fail"* ]] && [[ $out != *"not listed"* ]]
 }
 
+node_server_pids() {   # node server_pids <db>... : "<db> <pid> <pid start time>" (none when it does not run)
+  local st db pid
+  st=$(cubrid server status 2>/dev/null </dev/null)
+  for db in "$@"; do
+    pid=$(printf '%s\n' "$st" | sed -n "s/^ *\(HA-\)\{0,1\}Server $db (.*pid \([0-9]*\)).*/\2/p" | head -1)
+    echo "$db ${pid:-none} $(proc_start "${pid:-0}")"
+  done
+}
+
 node_hb_status() { timeout 30 cubrid heartbeat status 2>&1 </dev/null; }
 
 node_exists() { local p; for p in "$@"; do [ -e "$p" ] && echo "EXISTS $p" || echo "MISSING $p"; done; }
 
-# node keep_old <suffix> <db> <vol> <log> <repl_home> : move what is there aside; print MOVED/PARENT/CREATED/EMPTY lines
+# node keep_old <suffix> <db> <vol> <log> <repl_home> [<node>...] : move what is there aside; print MOVED/PARENT/CREATED/EMPTY
+# lines. Log copy folders: only <repl_home>/<db>_<node> of the given HA nodes (not every <db>_* name: another
+# database can be called <db>_something)
 # (PARENT: a missing parent folder that mkdir -p creates, outermost first)
 node_keep_old() {
-  local suffix=$1 db=$2 vol=$3 log=$4 home=$5 p d a paths=("$3") parents
+  local suffix=$1 db=$2 vol=$3 log=$4 home=$5 p d a x paths=("$3") parents
+  shift 5
   [ "$log" = "$vol" ] || paths+=("$log")
   for p in "${paths[@]}"; do
     if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; then
       mv "$p" "$p$suffix" && echo "MOVED $p" || return 1
     fi
   done
-  for d in "$home/${db}_"*; do
-    case $d in *.ha_add_nodes_*) continue ;; esac
+  for x in "$@"; do
+    d="$home/${db}_$x"
     [ -d "$d" ] || continue
     mv "$d" "$d$suffix" && echo "MOVED $d" || return 1
   done
@@ -405,6 +421,7 @@ node_main() {
     reload) node_reload ;;
     repl) node_repl "$@" ;;
     hb_status) node_hb_status ;;
+    server_pids) node_server_pids "$@" ;;
     exists) node_exists "$@" ;;
     keep_old) node_keep_old "$@" ;;
     move_back) node_move_back "$@" ;;
@@ -515,11 +532,20 @@ lock_edit() {   # lock_edit <function>: runs the function with the lock file con
   return $rc
 }
 lock_in_use() {   # 0 when another job holds the lock
-  local w u p t
+  # running: held while its script lives, and after it died without finishing (interrupted) until that job is rolled
+  # back. blocked: a job stopped with rollback_blocked, held until it is rolled back. Only that job's rollback passes.
+  local w u p t st
   read -r w u p t <<< "$LOCKED"
+  [ "$u" = "$UUID" ] && return 1
   case $w in
-    running) [ "$u" != "$UUID" ] && [ "$(proc_start "$p")" = "$t" ] ;;
-    starting) [ "$u" != "$UUID" ] && [ $(( $(epoch) - p )) -lt 60 ] ;;
+    running)
+      [ "$(proc_start "$p")" = "$t" ] && return 0
+      [[ $u =~ ^[0-9a-f]+$ ]] || return 1
+      st=$(sed -n 's/^status=//p; s/^action=/action /p' "${JOB_DIR%/*}/$u/job" 2>/dev/null | tr '\n' ' ')
+      # a plan changes nothing: it does not hold the lock after it died
+      [[ " $st " == *" running "* ]] && [[ " $st " != *" action plan "* ]] && [[ " $st " != *" action cleanup "* ]] ;;
+    blocked) return 0 ;;
+    starting) [ $(( $(epoch) - p )) -lt 60 ] ;;
     *) return 1 ;;
   esac
 }
@@ -528,6 +554,7 @@ lock_take_fn() {
   printf 'running %s %s %s\n' "$UUID" "$$" "$(proc_start $$)" > "$LOCK"
 }
 lock_free_fn() { case $LOCKED in "running $UUID "*) : > "$LOCK" ;; esac; }
+lock_block_fn() { case $LOCKED in "running $UUID "*) printf 'blocked %s\n' "$UUID" > "$LOCK" ;; esac; }
 
 # ------------------------------------------------ agent and remote execution
 
@@ -543,13 +570,16 @@ start_own_agent() {   # from a terminal: start the agent, which asks for the pas
 }
 
 declare -A NODE_LOCAL=() NODE_INFO=()
-OUT="" RC=0 LAST_ACTION=""
+OUT="" RC=0 LAST_ACTION="" TIMED_OUT=0 CANCEL_KILLED=0 NO_RESULT=0 MAY_HAVE_RUN=0 UNDO_FAILED=0
 # Each command runs in the background so a cancel is noticed at once. interruptible: on cancel the client is
 # stopped (the agent then drops the transfer); otherwise the command is waited for, up to its limit.
 proc_alive() { local st; st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1; st=${st##*) }; [ "${st%% *}" != Z ]; }
 run_bg() {   # run_bg <limit seconds> <interruptible 0|1> <command...> ; sets OUT, RC
   local limit=$1 intr=$2 pid t0 tmp noted=0
   shift 2
+  TIMED_OUT=0 CANCEL_KILLED=0
+  # nothing changes once the undo log cannot be written (I4)
+  if [ "$UNDO_FAILED" = 1 ] && [ "$IN_ROLLBACK" = 0 ]; then OUT="the undo log cannot be written"; RC=1; return 1; fi
   tmp=$(mktemp "$JOB_DIR/out.XXXXXX")
   # an asynchronous command gets /dev/null as stdin unless it is given one explicitly
   "$@" < "${RUN_IN:-/dev/null}" > "$tmp" 2>&1 &
@@ -560,7 +590,7 @@ run_bg() {   # run_bg <limit seconds> <interruptible 0|1> <command...> ; sets OU
       if [ "$intr" = 1 ]; then
         kill "$pid" 2>/dev/null
         wait "$pid" 2>/dev/null
-        OUT=$(cat "$tmp"); rm -f "$tmp"; RC=130
+        OUT=$(cat "$tmp"); rm -f "$tmp"; RC=130; CANCEL_KILLED=1
         return 130
       fi
       if [ $noted = 0 ]; then
@@ -572,7 +602,7 @@ run_bg() {   # run_bg <limit seconds> <interruptible 0|1> <command...> ; sets OU
       # KILL: during the rollback TERM is ignored, and an ignored signal stays ignored in the commands it starts
       kill -KILL "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
-      OUT=$(cat "$tmp"); rm -f "$tmp"; RC=124
+      OUT=$(cat "$tmp"); rm -f "$tmp"; RC=124; TIMED_OUT=1
       return 124
     fi
     sleep 0.2
@@ -602,10 +632,15 @@ on_node() {
   local full=$OUT body
   body=$(printf '%s\n' "$full" | awk '/^@@BEGIN$/ { on=1; next } /^@@END / { on=0; next } on')
   printf '%s\n' "$full" | sed 's/^/  /' >> "$LOG"
-  if [ "$RC" -eq 124 ] || [ "$RC" -eq 130 ]; then OUT=$body; return $RC; fi
+  NO_RESULT=0 MAY_HAVE_RUN=0
+  if [ "$TIMED_OUT" = 1 ] || [ "$CANCEL_KILLED" = 1 ]; then OUT=$body; return $RC; fi
   if ! printf '%s\n' "$full" | grep -q '^@@END '; then
     OUT=$(printf '%s' "$full" | grep '^cm_ssh: ' | tail -1)
     [ -n "$OUT" ] || OUT="no result from $host"
+    NO_RESULT=1
+    # the command may have run when the connection broke during it (or nothing came back at all);
+    # a failed login or channel means it never started
+    case $OUT in *"while the command ran"*|"no result from "*) MAY_HAVE_RUN=1 ;; esac
     RC=255
     return 255
   fi
@@ -622,7 +657,10 @@ undo_add() {   # undo_add <step no> <host> <kind> [args...] (no tabs in values)
   local n
   n=$(( $(grep -c '^U' "$UNDO" 2>/dev/null || echo 0) + 1 ))
   local IFS=$'\t'
-  printf 'U\t%s\t%s\t%s\t%s\n' "$n" "$1" "$2" "${*:3}" >> "$UNDO"
+  if ! printf 'U\t%s\t%s\t%s\t%s\n' "$n" "$1" "$2" "${*:3}" >> "$UNDO"; then
+    UNDO_FAILED=1
+    return 1
+  fi
 }
 
 # ------------------------------------------------ failure and cancel
@@ -842,6 +880,14 @@ st_node_check() {   # st_node_check <host> <existing|new> <role>
     done
     N_COPYBASE[$h]=$(kv "$info" HA_COPY_LOG_BASE); N_COPYBASE[$h]=${N_COPYBASE[$h]:-${N_CUBDB[$h]}}
   else
+    # a new node must not be in an HA setup (another group would lose this node)
+    local ham hnl hrl hb ham_on ni=${NODE_INFO[$h]}
+    ham=$(kv "$ni" HA_MODE); hnl=$(kv "$ni" HA_NODE_LIST); hrl=$(kv "$ni" HA_REPLICA_LIST); hb=$(kv "$ni" HEARTBEAT)
+    case $ham in on|yes|replica|ON|YES|REPLICA) ham_on=1 ;; *) ham_on=0 ;; esac
+    if [ "$ham_on" = 1 ] || [ -n "$hnl" ] || [ -n "$hrl" ] || [ "$hb" = yes ]; then
+      fail new_node_in_ha "$h: already set up for HA (ha_mode=${ham:-off}, ha_node_list=${hnl:-none}, ha_replica_list=${hrl:-none}, heartbeat running: $hb); a new node has to be a server without HA settings"
+      return 1
+    fi
     for db in "${D[@]}"; do
       [[ " $servers " != *" $db "* ]] || { fail slave_db_running "$h: database $db is running there; stop it first"; return 1; }
     done
@@ -859,6 +905,28 @@ st_node_check() {   # st_node_check <host> <existing|new> <role>
       NLG[$h/$db]=$(node_path "$h" "${DB_LOG[$db]}")
       NLOB[$h/$db]=""
       [ -n "${DB_LOB[$db]}" ] && NLOB[$h/$db]="file:$(node_path "$h" "${DB_LOB[$db]#file:}")"
+    done
+    # S12 moves the volume and log folders aside as a whole: each has to be a folder of this database only
+    local p q e other
+    for db in "${D[@]}"; do
+      for p in "${NV[$h/$db]}" "${NLG[$h/$db]}"; do
+        for q in "${N_CUBDB[$h]}" "${N_HOME[$h]}"; do
+          if [ "$p" = "$q" ] || [[ $q/ == "$p"/* ]]; then
+            fail db_path_conflict "$h: the folder of $db would be $p, which is or holds $q; it needs a folder of its own (give the database a folder of its own on $L)"
+            return 1
+          fi
+        done
+        for e in $(kv "${NODE_INFO[$h]}" DBPATHS); do
+          other=${e%%:*}
+          [[ " ${D[*]} " == *" $other "* ]] && continue
+          for q in $(e=${e#*:}; printf '%s %s' "${e%%:*}" "${e#*:}"); do
+            if [ "$p" = "$q" ] || [[ $q/ == "$p"/* ]] || [[ $p/ == "$q"/* ]]; then
+              fail db_path_conflict "$h: the folder of $db would be $p, which overlaps $q of database $other there"
+              return 1
+            fi
+          done
+        done
+      done
     done
   fi
   return 0
@@ -882,6 +950,14 @@ st_preflight() {   # <host>: L tries its backup folder; a new node its receiving
       return 1
     fi
     return 0
+  fi
+  # the new node connects to the master's cub_master with its own cubrid_port_id (copylogdb, S14)
+  local mp np
+  mp=$(conf_get "$CUBRID/conf/cubrid.conf" "[common]" cubrid_port_id); np=$(kv "${NODE_INFO[$h]}" CUBRID_PORT_ID)
+  if [ "${np:-1523}" != "${mp:-1523}" ]; then
+    pf_note "$h" "$(kv "${NODE_INFO[$h]}" CUBRID)/conf/cubrid.conf" port_mismatch "cubrid_port_id ${np:-1523}, $L has ${mp:-1523}"
+    fail port_mismatch "$h: cubrid_port_id is ${np:-1523}, $L has ${mp:-1523}; they must be the same"
+    return 1
   fi
   r=$(rbk_root "$h")
   local paths=() x
@@ -1086,14 +1162,16 @@ st_send_backup() {   # <no> <host> <db>
     LAST_ACTION="$h put"
     run_bg 21600 1 "$CM_SSH" put --agent "$AGENT" "$h" "$f" "$dst/$(basename "$f")"
     printf '%s\n' "$OUT" | grep -v '^progress [0-9]' | sed 's/^/  /' >> "$LOG"
-    [ "$RC" -eq 0 ] || { [ "$RC" -eq 130 ] && { fail cancelled cancelled; return 1; }; fail transfer_failed "$h: $(printf '%s' "$OUT" | grep '^cm_ssh: ' | tail -1)"; return 1; }
+    [ "$RC" -eq 0 ] || { [ "$CANCEL_KILLED" = 1 ] && { fail cancelled cancelled; return 1; }; fail transfer_failed "$h: $(printf '%s' "$OUT" | grep '^cm_ssh: ' | tail -1)"; return 1; }
   done
 }
 
 declare -A CLEAR_AT_RESTORE=()
 st_keep_old() {   # <no> <host> <db>
   local no=$1 h=$2 db=$3 l kind p
-  on_node "$h" 600 0 keep_old ".ha_add_nodes_$TAG" "$db" "${NV[$h/$db]}" "${NLG[$h/$db]}" "${N_HOME[$h]}"
+  local peers=() x
+  for x in $(list_hosts "$(final_node_list)"); do [ "$x" = "$h" ] || peers+=("$x"); done
+  on_node "$h" 600 0 keep_old ".ha_add_nodes_$TAG" "$db" "${NV[$h/$db]}" "${NLG[$h/$db]}" "${N_HOME[$h]}" "${peers[@]}"
   local rc=$RC
   while read -r kind p; do
     case $kind in
@@ -1328,6 +1406,46 @@ run_step() {   # run_step <index>
   esac
 }
 
+# ------------------------------------------------ the master stays the same server
+
+# Taken before the backup (S9), compared after the first log copies (before S15) and before the existing nodes are
+# changed (S17): a failover or a restart of the master in between would leave the new nodes copying from a server
+# that is no longer the one the backup came from.
+MSNAP=""
+master_state() {   # sets MSTATE: "<db> <mode> <pid> <pid start>" lines of the master
+  local m p
+  on_node "$MASTER_HOST" 120 0 mode "${D[@]}" || return 1
+  m=$OUT
+  on_node "$MASTER_HOST" 60 0 server_pids "${D[@]}" || return 1
+  p=$OUT
+  MSTATE=$(local db; for db in "${D[@]}"; do
+    printf '%s %s %s\n' "$db" "$(printf '%s\n' "$m" | awk -v d="$db" '$1 == d { print $2 }')" \
+      "$(printf '%s\n' "$p" | awk -v d="$db" '$1 == d { print $2, $3 }')"
+  done)
+}
+master_guard() {   # master_guard <index>: before S9 record, before the first S15 and the first S17 compare
+  local id=${S_ID[$1]} prev=""
+  [ "$1" -gt 0 ] && prev=${S_ID[$(($1 - 1))]}
+  case $id in
+    backup) [ -n "$MSNAP" ] && return 0 ;;
+    new_ha_start|existing_config) [ "$prev" = "$id" ] && return 0; [ -n "$MSNAP" ] || return 0 ;;
+    *) return 0 ;;
+  esac
+  master_state || { fail master_changed "$MASTER_HOST: cannot read the state of the master ($(one_line "$OUT"))"; return 1; }
+  if [ "$id" = backup ]; then
+    if printf '%s\n' "$MSTATE" | awk '$2 != "active" || $3 == "none" { bad = 1 } END { exit !bad }'; then
+      fail master_changed "$MASTER_HOST is not the active master of every database: $(one_line "$MSTATE")"; return 1
+    fi
+    MSNAP=$MSTATE; JOB[master_state]=$(one_line "$MSTATE"); job_write
+    log "master state: $(one_line "$MSTATE")"
+    return 0
+  fi
+  if [ "$MSTATE" != "$MSNAP" ]; then
+    fail master_changed "the master changed since the backup (failover or restart): before $(one_line "$MSNAP"), now $(one_line "$MSTATE")"
+    return 1
+  fi
+}
+
 # ------------------------------------------------ rollback
 
 undo_one() {   # undo_one <host> <kind> [args...] ; 0 when it is back
@@ -1357,22 +1475,24 @@ rollback_all() {
   job_set phase rollback
   log "rolling back"
   [ -s "$UNDO" ] || { log "nothing to undo"; return 0; }
-  local lines=() line n step h kind args unrestored=""
-  # a node that did not answer an undo is not tried again in this run: its lines are left for a later rollback
+  local lines=() line n step h kind args unrestored="" blocked=0
+  # once an undo fails on a node, its later lines are not run in this run (they may depend on it): they are left for
+  # a later rollback. A timeout, or a lost connection under a command that may still run, also blocks (I6).
   local -A dead=()
+  [ "$CONVERT_LAST" -gt 0 ] || CONVERT_LAST=$(awk -F'\t' '$1 == "C" { v = $2 } END { print v + 0 }' "$UNDO")
   mapfile -t lines < <(grep '^U' "$UNDO")
   local i
   for (( i=${#lines[@]}-1; i>=0; i-- )); do
     IFS=$'\t' read -r _ n step h kind args <<< "${lines[$i]}"
     grep -qx "D"$'\t'"$n" "$UNDO" && continue
-    if [ "$CONVERT_LAST" -gt 0 ] && [ "$step" -le "$CONVERT_LAST" ] && [ "$ROLLBACK_CONVERT" = 0 ] && [ "${JOB[convert_done]:-0}" = 1 ]; then
+    if [ "$CONVERT_LAST" -gt 0 ] && [ "$step" -le "$CONVERT_LAST" ] && [ "$ROLLBACK_CONVERT" = 0 ]; then
       continue
     fi
     local IFS_SAVE=$IFS
     IFS=$'\t'; read -ra a <<< "$args"; IFS=$IFS_SAVE
     if [ -n "${dead[$h]:-}" ]; then
       unrestored+="$h $kind ${args//$'\t'/ };"
-      if [ ${#S_ID[@]} -ge "$step" ]; then step_set $((step - 1)) rollback_failed "$h: no answer, not tried"; fi
+      if [ ${#S_ID[@]} -ge "$step" ]; then step_set $((step - 1)) rollback_failed "$h: not tried (${dead[$h]})"; fi
       continue
     fi
     if undo_one "$h" "$kind" "${a[@]}"; then
@@ -1380,7 +1500,12 @@ rollback_all() {
       if [ ${#S_ID[@]} -ge "$step" ] && [ "${S_STATE[$((step - 1))]}" != rollback_failed ]; then step_set $((step - 1)) rolled_back; fi
     else
       unrestored+="$h $kind ${args//$'\t'/ };"
-      { [ "$RC" = 124 ] || [ "$RC" = 255 ]; } && dead[$h]=1
+      if [ "$TIMED_OUT" = 1 ] || { [ "$NO_RESULT" = 1 ] && [ "$MAY_HAVE_RUN" = 1 ] && may_still_run "${LAST_ACTION#* }"; }; then
+        blocked=1; dead[$h]="no answer to an earlier undo"
+        RB_NOTE="undoing stopped on $h: $kind did not finish in time or the connection broke"
+      elif [ "$NO_RESULT" = 1 ]; then dead[$h]="no answer to an earlier undo"
+      else dead[$h]="an earlier undo failed"
+      fi
       if [ ${#S_ID[@]} -ge "$step" ]; then step_set $((step - 1)) rollback_failed "$(one_line "$OUT")"; fi
       log "could not undo on $h: $kind $args ($OUT)"
     fi
@@ -1388,6 +1513,7 @@ rollback_all() {
   JOB[unrestored]=$unrestored
   [ -z "$unrestored" ] && JOB[kept]=""
   job_write
+  [ "$blocked" = 1 ] && return 2
   [ -z "$unrestored" ]
 }
 
@@ -1494,7 +1620,8 @@ write_plan() {
 finish() {   # finish <status>
   JOB[status]=$1; JOB[phase]=done; JOB[ended_at]=$(epoch); JOB[detail]=""
   job_write
-  lock_edit lock_free_fn
+  # rollback_blocked keeps the lock (a command may still run on a node) until this job is rolled back
+  if [ "$1" = rollback_blocked ]; then lock_edit lock_block_fn; else lock_edit lock_free_fn; fi
   [ -n "$AGENT" ] && "$CM_SSH" quit --agent "$AGENT" >/dev/null 2>&1
   log "job ends: $1"
   exit 0
@@ -1516,7 +1643,7 @@ fi
 job_write
 log "$PROG $ACTION (job $UUID)"
 if ! lock_edit lock_take_fn; then
-  JOB[error]=busy; JOB[message]="another job is running: $LOCKED"; job_write
+  JOB[error]=busy; JOB[message]="another job holds the lock (roll back a stopped job first): $LOCKED"; job_write
   JOB[status]=fail; JOB[phase]=done; job_write
   [ -n "$AGENT" ] && "$CM_SSH" quit --agent "$AGENT" >/dev/null 2>&1
   exit 1
@@ -1533,7 +1660,7 @@ if ! parse_inputs; then JOB[error]=$FAIL_CODE; JOB[message]=$FAIL_MSG; finish fa
 
 if [ "$ACTION" = rollback ]; then
   # the step list is not needed: the undo log has everything, done lines are skipped
-  ROLLBACK_CONVERT=1
+  # the promotion is undone only with the job's --rollback-convert (the undo log marks where it ended)
   # the step table of the job being undone, so the screen sees rolled_back / rollback_failed per step
   if [ -s "$JOB_DIR/steps" ]; then
     S_ID=() S_TITLE=() S_NODE=() S_DB=() S_STATE=() S_DETAIL=() S_STAGE=()
@@ -1548,7 +1675,12 @@ if [ "$ACTION" = rollback ]; then
   fi
   for h in "${EX_HOST[@]}" "${NEW_HOST[@]}"; do NODE_LOCAL[$h]=0; done
   NODE_LOCAL[$L]=1
-  if rollback_all; then finish rolled_back; else JOB[error]=rollback_incomplete; JOB[message]="some changes could not be undone"; finish rollback_failed; fi
+  RB_NOTE=""
+  rollback_all; rb=$?
+  [ $rb = 0 ] && finish rolled_back
+  JOB[error]=rollback_incomplete; JOB[message]="some changes could not be undone${RB_NOTE:+; $RB_NOTE}"
+  [ $rb = 2 ] && finish rollback_blocked
+  finish rollback_failed
 fi
 if [ "$ACTION" = cleanup ]; then
   # the old databases kept aside by a successful job: "kept" of its job file, given again by the manager
@@ -1612,17 +1744,27 @@ for i in "${!S_ID[@]}"; do
   JOB[step_no]=$((i + 1)); job_write
   log "step $((i + 1))/${#S_ID[@]} ${S_ID[$i]}${S_NODE[$i]:+ [${S_NODE[$i]}]}${S_DB[$i]:+ [${S_DB[$i]}]}"
   FAIL_CODE="" FAIL_MSG=""
-  if run_step "$i"; then
+  if master_guard "$i" && run_step "$i"; then
     step_set "$i" done
-    [ "${S_ID[$i]}" = convert_start_others ] && { JOB[convert_done]=1; CONVERT_LAST=$((i + 1)); job_write; }
+    if [ "${S_ID[$i]}" = convert_start_others ]; then
+      JOB[convert_done]=1; CONVERT_LAST=$((i + 1)); job_write
+      printf 'C\t%s\n' "$CONVERT_LAST" >> "$UNDO" || UNDO_FAILED=1
+    fi
     continue
   fi
-  if [ "$RC" = 124 ]; then
+  if [ "$FAIL_CODE" = master_changed ]; then :
+  elif [ "$TIMED_OUT" = 1 ]; then
     if may_still_run "${LAST_ACTION#* }"; then FAIL_CODE=no_response; FAIL_MSG="no answer in time: $FAIL_MSG"
     else FAIL_CODE=no_answer; FAIL_MSG="no answer in time from ${LAST_ACTION%% *} (${LAST_ACTION#* }), taken as a lost connection: $FAIL_MSG"
     fi
+  elif [ "$NO_RESULT" = 1 ] && [ "$MAY_HAVE_RUN" = 1 ] && may_still_run "${LAST_ACTION#* }"; then
+    FAIL_CODE=connection_lost
+    FAIL_MSG="the connection to ${LAST_ACTION%% *} broke while ${LAST_ACTION#* } ran; it may still be running there: $FAIL_MSG"
   fi
-  [ "$CANCEL" = 1 ] && [ "$FAIL_CODE" != no_response ] && { FAIL_CODE=cancelled; FAIL_MSG="cancelled during ${S_ID[$i]}${FAIL_MSG:+ ($FAIL_MSG)}"; }
+  [ "$UNDO_FAILED" = 1 ] && { FAIL_CODE=undo_write_failed; FAIL_MSG="cannot write the undo log $UNDO: $FAIL_MSG"; }
+  case $FAIL_CODE in no_response|connection_lost|undo_write_failed|master_changed) ;; *)
+    [ "$CANCEL" = 1 ] && { FAIL_CODE=cancelled; FAIL_MSG="cancelled during ${S_ID[$i]}${FAIL_MSG:+ ($FAIL_MSG)}"; } ;;
+  esac
   step_set "$i" failed "$FAIL_MSG"
   failed_at=$i
   break
@@ -1635,12 +1777,17 @@ if [ "$failed_at" -lt 0 ]; then
 fi
 
 JOB[error]=$FAIL_CODE; JOB[message]=$FAIL_MSG; job_write
-if [ "$FAIL_CODE" = no_response ]; then
-  # a command did not come back: nothing is undone on top of it; the user checks the node and calls rollback
+if [ "$FAIL_CODE" = no_response ] || [ "$FAIL_CODE" = connection_lost ]; then
+  # a command did not come back and may still run: nothing is undone on top of it; the user checks the node
+  # and calls rollback (the lock stays until then)
   finish rollback_blocked
 fi
-if rollback_all; then
+RB_NOTE=""
+rollback_all; rb=$?
+if [ $rb = 0 ]; then
   [ "$FAIL_CODE" = cancelled ] && finish cancelled
   finish fail
 fi
+[ -n "$RB_NOTE" ] && JOB[message]="$FAIL_MSG; $RB_NOTE"
+[ $rb = 2 ] && finish rollback_blocked
 finish rollback_failed
