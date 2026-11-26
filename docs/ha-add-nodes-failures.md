@@ -25,8 +25,8 @@
 | `fail` | 실패 후 되돌리기가 모두 됨(승격은 기본으로 유지) |
 | `cancelled` | 취소 후 되돌리기가 모두 됨 |
 | `rollback_failed` | 되돌리기 중 일부가 안 됨. `unrestored[]`에 노드·종류·경로 |
-| `rollback_blocked` | 아직 돌고 있을 수 있는 명령(2.6의 종류)이 제한 시간 안에 끝나지 않아 되돌리기를 하지 않고 멈춤 |
-| `interrupted` | 스크립트가 끝나지 않은 채 사라짐(L 다운 등). `rollback`으로 되돌림 |
+| `rollback_blocked` | 아직 돌고 있을 수 있는 명령(2.6의 종류)이 제한 시간 안에 끝나지 않았거나 그 중 연결이 끊겨 되돌리기를 하지 않고 멈춤. 또는 되돌리기 중 같은 일이 생김. 이 작업을 되돌릴 때까지 잠금을 유지함 |
+| `interrupted` | 스크립트가 끝나지 않은 채 사라짐(L 다운 등). `rollback`으로 되돌림. `run`·`rollback` 작업이면 되돌릴 때까지 잠금을 유지함(`plan`은 아님) |
 
 ## 2. 실패 유형별 표
 
@@ -132,7 +132,8 @@
 
 | 단계 | 알아차림 | 현재 | 보완 | 사용자 |
 |---|---|---|---|---|
-| S9 이전 | S1에서 M active 확인 | 확인 뒤 바뀌면 S9가 실패할 수 있음 | S9·S17 직전에 M active를 다시 확인. 아니면 바꾸기 전에 멈춤(`fail`, 되돌리기는 새 노드 쪽만) | failover가 끝난 뒤 새 마스터에서 다시 실행 |
+| S9 이전 | S9 직전에 M의 D가 모두 active인지와 cub_server pid·시작 시각을 기록(`master_changed`면 멈춤) | 구현됨 | — | failover가 끝난 뒤 새 마스터에서 다시 실행 |
+| S9~S16 | S15 직전(S14 뒤)·S17 직전에 다시 읽어 기록과 다르면 `master_changed`로 멈추고 되돌림 | 구현됨(실측: S10 중 M의 cub_server를 죽여 다시 뜨게 함 → S15 직전 `master_changed`, `fail`) | 적용 진행 확인(S19)은 부분 실패 정책과 함께 | 같음 |
 | S13·S14 | `-m <M>`이 더 이상 마스터가 아님 | 복원·첫 로그 복사는 될 수 있으나 S15 뒤 확인에서 실패할 수 있음 | 같음(S15 직전에도 확인) | 같음 |
 | S17·S18 | E 설정을 바꾸는 중에 마스터가 바뀜 | reload가 failover와 겹침 | S17 직전 확인에서 멈춤. 이미 시작했으면 끝까지 가지 않고 `rollback_blocked`로 멈춰 사람이 판단 | 수동 절차 R2 |
 
@@ -166,9 +167,9 @@
 
 | 상황 | 자동 동작 | 끝 상태 | 사용자 |
 |---|---|---|---|
-| 한 노드에 접속 안 됨·답 없음 | 그 노드의 첫 줄이 실패하면(제한 시간 또는 헬퍼 오류) 그 노드의 남은 줄은 시도하지 않고 건너뜀. 다른 노드는 계속 | `rollback_failed`, `unrestored[]`, 그 단계 표시 "no answer, not tried" | 노드가 살아난 뒤 `rollback` |
+| 한 노드의 되돌리기 줄이 실패 | 이유와 상관없이 그 노드의 남은 줄은 이번에는 하지 않고 `unrestored`로 남김(뒤 줄이 앞 줄에 기대므로). 다른 노드는 계속. 그 줄이 제한 시간을 넘었거나, 오래 걸리는 명령 중 연결이 끊겼으면 끝 상태는 `rollback_blocked` | `rollback_failed` 또는 `rollback_blocked`, 단계 표시 "not tried (…)" | 노드를 확인한 뒤 `rollback` |
 | 새 노드의 다른 DB가 이미 떠 있음(S15 전에 실패) | 그 DB 다시 띄우기는 떠 있지 않은 것만 띄움 | 영향 없음 | 없음 |
-| `repl stop`이 실패 문구 | 그 줄 실패로 기록, 계속 | 같음 | R2 |
+| `repl stop`이 실패 문구 | 그 줄 실패로 기록, 그 노드 남은 줄은 하지 않음 | 같음 | R2 |
 | `.bak` 사본이 없어짐 | "되돌릴 것 없음"으로 기록 | `fail` 또는 `rollback_failed` | 파일 내용 확인 |
 | 되돌리기 중 L 다운 | 스크립트가 사라짐 | `interrupted` | 다시 `rollback`(끝난 줄은 건너뜀) |
 
@@ -179,18 +180,20 @@
 | 코드 | 원인 | 단계 | 끝 상태 | 사용자 할 일 |
 |---|---|---|---|---|
 | `local_ssh_missing` | L에 `ssh`·`ssh-keyscan`·`ssh-keygen`·`setsid` 중 없는 것(이름을 밝힘) | C3 | `fail` | openssh-clients 설치 |
+| `ssh_failed` | 다른 코드에 들지 않는 ssh 실패(키 교환·암호 협상 실패, No route to host, Connection reset 등). 문구에 ssh 원문 한 줄 | C3·작업 중 | `fail` | 원문에 따라 망·sshd 설정 확인 |
+| `account_no_shell` | 로그인 셸이 로그인을 막음(nologin) | S2 | `fail` | 계정의 로그인 셸 확인 |
 | `name_unresolved` | 노드 이름을 풀 수 없음 | C3 | `fail` | /etc/hosts·DNS |
 | `port_refused` | ssh 포트 연결 거부 | C3 | `fail` | sshd 실행·포트 확인 |
 | `port_timeout` | ssh 포트 연결 시간 초과 | C3 | `fail` | 방화벽·망 확인 |
 | `hostkey_mismatch` | 호스트 키가 확인한 지문과 다름 | C3 | `fail` | 키가 바뀐 이유 확인 후 지문 다시 확인 |
 | `no_password_auth` | sshd가 password·keyboard-interactive를 모두 막음 | C3 | `fail` | sshd 설정에서 둘 중 하나 허용 |
-| `auth_failed` | 비밀번호 틀림(다시 시도하지 않음) | C3 | `fail` | 계정·비밀번호 확인, 잠김이면 해제 요청 |
+| `auth_failed` | 비밀번호 틀림, 계정 잠김(faillock), 허용 안 된 계정(AllowUsers·DenyUsers, pam_access), 비밀번호 만료, MaxAuthTries. 다시 시도하지 않음 | C3 | `fail` | 비밀번호 확인, 맞다면 노드 관리자에게 잠김·허용 여부 확인 |
 | `remote_shell_failed` | 원격에서 셸을 실행할 수 없음 | S2 | `fail` | 계정의 로그인 셸 확인 |
 | `cubrid_not_found` | 그 계정에 CUBRID 환경이 없음 | S2 | `fail` | CUBRID 설치 계정으로 다시 입력 |
 | `node_script_missing` / `node_script_version_mismatch` / `node_script_tampered` / `node_script_unsafe` | 노드 스크립트가 없음 / 버전이 다름 / 해시가 다름 / 권한이 느슨함 | S2 | `fail` | 같은 패키지로 맞춤·파일 복구·권한 복구 |
 | `version_mismatch` | CUBRID 전체 버전이 다름(노드 이름과 양쪽 버전) | S2 | `fail` | 같은 버전으로 맞춤 |
 | `controlpath_too_long` | 제어 소켓 경로가 너무 김 | C3 | `fail` | `$CUBRID` 경로 확인 |
-| `connection_lost` | 작업 중 그 노드의 연결이 끝남 | S4~S21 | 2.1대로 `fail`·`rollback_failed` | 노드가 살아나면 비밀번호를 다시 넣고 `rollback` |
+| `connection_lost` | 작업 중 그 노드의 연결이 끝남(255 + 결과 표시 없음 + `-O check` 실패) | S4~S21 | 오래 걸리는 명령 중이면 `rollback_blocked`, 아니면 되돌림(그 노드는 `unrestored`) → `rollback_failed` | 노드가 살아나면 비밀번호를 다시 넣고 `rollback` |
 | `no_answer` | 작업 중 바로 끝나는 명령이 답하지 않음 | S4~S21 | 2.1대로 | 같음 |
 | `no_response` | 작업 중 오래 걸리는 명령이 끝나지 않음 | S9~S18 | `rollback_blocked` | 노드에서 명령이 끝났는지 확인 후 `rollback`(R3) |
 

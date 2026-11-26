@@ -391,6 +391,8 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 - 내용: `starting <uuid> <시각>`(C2가 씀) → `running <uuid> <스크립트 pid> <pid 시작 시각>`(스크립트가 시작할 때 씀) → 끝나면 비움.
 - 판단: `running`이면 그 pid가 살아 있고 시작 시각이 같을 때만 사용 중임. `starting`이면 60초가 지나면 버려진 것으로 봄. 같은 때 들어온 두 요청은 flock 안에서 차례로 보므로 하나만 통과함.
 - `rollback`·`cleanup`은 원래 작업의 스크립트·헬퍼가 살아 있으면 거절함(옛 헬퍼가 남아 있으면 CMS가 먼저 `quit`을 보냄).
+- `rollback_blocked`로 끝난 작업은 잠금에 `blocked <uuid>`를 남기고, `run`·`rollback` 작업의 스크립트가 끝나지 않고 사라지면(`interrupted`) `running` 내용이 그대로 남아 잡힌 것으로 봄. 둘 다 그 작업의 `rollback`만 통과하고 다른 작업은 "먼저 되돌리라"로 거절함. 그 작업의 `rollback`을 띄우지 못하면 CMS가 잠금을 원래 내용으로 돌려놓음.
+- 승격 경계: 승격 단계가 끝나면 `undo`에 `C <단계 번호>` 줄을 씀. `rollback`(동작 포함)은 원래 작업의 `--rollback-convert`를 따라, 없으면 그 번호까지의 줄을 건너뜀(승격 유지).
 
 ### 9.3 취소
 
@@ -608,16 +610,16 @@ askpass까지 비밀번호를 넘기는 방법
 |---|---|---|
 | `hostkey <호스트> <포트>` | `ssh-keyscan -T 10 -p <포트> <호스트>` → `ssh-keygen -lf <파일>`로 SHA256 지문 | 인증 없음. `ha_check_ssh` 첫 호출 |
 | `check` | 3.1의 1~5를 일회용 ControlPath로 하고 `uname -n`, CUBRID 경로·버전, 노드 스크립트 버전·sha256을 읽은 뒤 `-O exit` | 로그인 시도 한 번 |
-| `agent`(비밀번호 들고 대기) | C3에서 노드마다 ControlMaster(`-M -N -f`, `ControlPersist=900`: 마지막 사용 뒤 15분이면 스스로 끝남) | 비밀번호는 로그인에만 쓰고 남기지 않음 |
-| `bind <pid>`(스크립트가 죽으면 헬퍼도 끝) | 대응 없음. 스크립트가 끝날 때 `-O exit`, 스크립트가 죽으면 ControlPersist 시간 뒤 끝남. CMS가 상태 조회에서 `interrupted`를 보거나 `rollback`·`cleanup`을 받으면 남은 것에 `-O exit` | 죽은 뒤 최대 15분 동안 같은 계정이 소켓으로 그 노드에 명령할 수 있음(4.2 남는 위험과 같은 성격) |
+| `agent`(비밀번호 들고 대기) | C3에서 노드마다 ControlMaster(`-M -N -f`, `ControlPersist=yes`: 시간 제한 없음, 정리는 3.8) | 비밀번호는 로그인에만 쓰고 남기지 않음 |
+| `bind <pid>`(스크립트가 죽으면 헬퍼도 끝) | 감시 셸(3.8)이 스크립트가 어떻게 끝나든 노드마다 `-O exit`. 감시 셸까지 죽으면 CMS가 `interrupted`를 볼 때·`rollback`·`cleanup`을 받을 때 `-O exit` | 그 사이 같은 계정이 소켓으로 그 노드에 명령할 수 있음(4.2 남는 위험과 같은 성격) |
 | `exec` | `ssh -S <cp> -o ControlMaster=no -T <노드> <노드 스크립트 경로> <하위 명령> <인자>` | 원격 셸이 명령 문자열을 해석하므로 인자는 지금처럼 모두 따옴표 처리. csh·tcsh 계정도 경로 + 인자만이라 문법 차이 없음 |
 | `exec --stdin` | 같은 명령에 표준 입력을 넘김 | |
 | `exec --daemon` | 쓰지 않음(노드 스크립트가 데몬을 `setsid … </dev/null >파일 2>&1`로 띄움. 지금도 같음) | |
 | `put`(SFTP, 이어 올리기, 원격 sha256) | 노드 스크립트 `recv <경로> <크기> <sha256>`에 `ssh … <` 로 흘려 보냄. 끊기면 `recv --size`로 받은 크기를 묻고 `tail -c +<크기+1> | ssh … recv --append`로 이어 보냄(최대 3번). 끝에 노드 스크립트가 크기·sha256을 비교 | scp는 OpenSSH 9.0부터 SFTP를 쓰므로 SFTP를 막은 서버에서 안 됨. `cat` 흐름은 SFTP 하위 시스템이 필요 없음 |
 | `quit` | `ssh -S <cp> -O exit <노드>` | |
 | 취소 중 원격 명령 | 지금과 같음: 로컬 `ssh` 클라이언트만 끝냄. 원격 명령은 채널이 닫혀도 계속 돌 수 있으므로 9.3의 "끝난 뒤" 규칙과 rollback_blocked 판단을 그대로 씀 | |
-| 응답 없는 노드 | ControlMaster에 `ServerAliveInterval=15`, `ServerAliveCountMax=4` → 약 60초 무응답이면 마스터가 끝남 → 그 뒤 명령은 바로 종료 코드 255(`connection_lost`). 지금의 제한 시간 판단(2.1·2.6)은 그대로 둠 | 망이 패킷을 버리는 끊김도 60초 안에 드러남 |
-| ControlPath 길이 | 유닉스 소켓 경로는 108바이트(리눅스)까지. `ssh`가 만들 때 임시 이름(약 17자)을 붙임. 작업 폴더 아래 대신 짧은 경로 `$CUBRID/tmp/hs<작업 번호 앞 8자>/%C`(`%C`는 40자 해시)를 씀. C3가 길이를 계산해 넘으면 `controlpath_too_long`으로 거절 | `$CUBRID`가 아주 길 때만 걸림 |
+| 응답 없는 노드 | ControlMaster에 `ServerAliveInterval=15`, `ServerAliveCountMax=20` → 약 5분 무응답이면 마스터가 끝남(몇 분 끊김은 견딤) → 그 뒤 명령은 `-O check` 실패로 바로 `connection_lost`. 지금의 제한 시간 판단(2.1·2.6)은 그대로 둠 | 다시 로그인하지 않음(3.8) |
+| ControlPath 길이 | 유닉스 소켓 경로는 108바이트(리눅스)까지. `ssh`가 만들 때 임시 이름(약 17자)을 붙임. 실행마다 새 폴더 `$CUBRID/tmp/hs<임의 8자>/<노드 순번>`(3.8). C3가 길이를 계산해 넘으면 `controlpath_too_long`으로 거절 | `$CUBRID`가 아주 길 때만 걸림 |
 | 정리 | 끝(`finish`)에서 노드마다 `-O exit`, 짧은 경로 폴더 삭제 | |
 
 ### 3.3 없어지는 것, 새로 생기는 것
@@ -710,6 +712,7 @@ askpass까지 비밀번호를 넘기는 방법
 | `no_response` | 오래 걸리는 명령이 시간 안에 끝나지 않음(지금과 같음, `rollback_blocked`) | 제한 시간 | S9~S18 | 그 명령이 끝났는지 노드에서 확인 후 `rollback`(R3) |
 
 - `unreachable`은 v5에서 `port_refused`·`port_timeout`·`name_unresolved`로 나뉘어 없어짐
+- 작업 중 연결이 끝난 노드는 상태 응답 `lost_nodes[]`(호스트 이름)로 줌. `rollback`에는 `unrestored[]`의 `node`에 나오는 노드(되돌릴 줄이 남은 노드, 끊긴 노드 포함) 모두의 비밀번호가 필요함. 작업이 끝날 때 ControlMaster를 모두 닫으므로(`-O exit`) 끊기지 않은 노드도 다시 로그인해야 하기 때문임. `rollback_failed`로 끝나도 같은 방법으로 `rollback`을 다시 부르면 끝난 줄은 건너뛰고 남은 줄만 함
 - 같은 표를 실패 목록표에 넣음(2.15)
 
 ### 3.6 스크립트 위조 확인(sha256)
@@ -845,3 +848,116 @@ askpass까지 비밀번호를 넘기는 방법
 - 새 노드의 복제 로그 경로가 B와 다를 때 `-s slave` 복원 뒤 `db_ha_apply_info`가 비는지(4.1 소스 판단의 실측)
 - 레플리카 원본에서 백업이 오래 걸릴 때 보관 로그 삭제로 백업이 실패하는지
 - B의 반영 지연이 클 때 S14가 M의 보관 로그 삭제로 실패하는 지점
+
+### 3.8 검토 반영 — 구현 기준 (3.1~3.7과 다르면 이 절이 우선)
+
+v5 설계 검토(인증 소켓 수명, C3 막힘, 다시 로그인 불가, 노드 스크립트 인자, ssh 설정 격리, 오류 분류, 해시 확인 틈, ControlPath 폴더)를 반영한 규칙임. 결정: 작업 중 끊긴 노드에 다시 로그인하지 않는 것은 받아들임(되돌리기 때 비밀번호 다시 입력이 기본 흐름).
+
+#### 3.8.1 공통 규칙 (CMS·스크립트)
+
+| 규칙 | 내용 |
+|---|---|
+| 설정 격리 | 모든 ssh 호출은 `-F <작업 폴더>/ssh_config.<실행 번호>`. 계정의 `~/.ssh/config`는 읽지 않고, 파일 끝 `Include /etc/ssh/ssh_config`로 OS 설정(RHEL crypto-policies)은 유지. ssh 설정은 먼저 나온 값이 이기므로 작업 값이 OS 값보다 앞섬. `-F /dev/null`은 쓰지 않음 |
+| 공통 값 | `ControlMaster no`, `BatchMode yes`, `PubkeyAuthentication no`, `GSSAPIAuthentication no`, `HostbasedAuthentication no`, `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `ProxyJump none`, `StrictHostKeyChecking yes`, `GlobalKnownHostsFile /dev/null`, `UserKnownHostsFile <작업 known_hosts>`, `UpdateHostKeys no`, `CheckHostIP no`, `ConnectTimeout 10`, `ServerAliveInterval 15`, `ServerAliveCountMax 20`, `ForwardAgent no`, `ForwardX11 no`, `ClearAllForwardings yes` |
+| 노드마다 | `Host <요청의 host>` 블록에 `HostName`, `Port`, `User`, `ControlPath`, `HostKeyAlgorithms`. C3와 스크립트가 같은 블록을 씀(User·Port가 어긋날 일 없음) |
+| 인증 없는 호출 | 스크립트 쪽 ssh는 인증 방법이 모두 꺼져 있음. 마스터가 없을 때 보통 접속으로 넘어가도 인증 시도 없이 255로 끝남(계정 잠금 횟수가 오르지 않음). 그리고 호출 전마다 `-O check` |
+| 마스터 수명 | `ControlPersist=yes`(시간 제한 없음). 정리는 S21 끝·감시 셸·CMS(3.8.2) |
+| ControlPath 폴더 | 실행마다 새 폴더 `$CUBRID/tmp/hs<임의 8자>`(700, 이미 있으면 실패), 소켓 이름은 노드 순번. `rollback`·`cleanup`도 새 폴더. 새 로그인 전에 옛 실행 폴더의 마스터에 `-O exit` |
+| 끊김 판단 | ServerAlive 15초 × 20 = 약 5분 무응답이면 마스터가 끝남. 다시 로그인하지 않음 |
+
+#### 3.8.2 CMS 쪽 (C3·C4·`ha_check_ssh`)
+
+요청 시간 제한(확인한 사실)
+
+| 구간 | 제한 | 근거 |
+|---|---|---|
+| 브라우저 → NCA | 60초(기본값) | NCA apiClient 기본 timeout |
+| NCA → CMS `ha_add_nodes` | 없음(`ha_check_ssh`만 40초) | NCA ha.service가 timeoutMs 없이 부름 |
+| CMS | 연결당 360초 | cm_httpd.cpp `DEFAULT_HTTP_TIMEOUT` |
+| CMS 동시 처리 | 요청 처리 스레드 22개가 각자 받음. `ha_*` task는 받은 스레드에서 끝까지 돎 | cm_httpd.cpp, cm_server_extend_interface.cpp |
+
+- 그래서 C3는 요청 안에서 노드끼리 병렬로 로그인하고 전체를 30초 안에 끝냄(넘으면 남은 노드는 `port_timeout`)
+
+C3 `cms_login`(노드마다, 노드끼리는 병렬)
+
+| 차례 | 하는 일 | 제한 | 실패 코드 |
+|---|---|---|---|
+| 0 | L의 `ssh`·`ssh-keyscan`·`ssh-keygen`·`setsid` 확인, `ha_askpass.sh` 해시·권한 확인 | — | `local_ssh_missing`, `script_tampered`, `script_unsafe` |
+| 1 | 새 ControlPath 폴더, 길이 확인, 옛 실행 폴더 마스터 `-O exit` | — | `controlpath_too_long` |
+| 2 | 이름 풀기 | — | `name_unresolved` |
+| 3 | `ssh-keyscan -T 10`, 화면 지문과 같은 키 한 줄만 작업 `known_hosts`에, 그 키 종류로 `HostKeyAlgorithms` 고정. 키를 못 받으면 포트에 직접 접속해 거부·시간 초과를 가림 | 12초 | `port_refused`, `port_timeout`, `hostkey_mismatch` |
+| 4 | 허용 인증 방법 확인(`PreferredAuthentications=none`, `BatchMode=yes`). password가 있으면 그것, 없으면 keyboard-interactive 하나만 | 12초 | `no_password_auth` |
+| 5 | FIFO(`<작업 폴더>/pw.<임의 16자>`, 0600), `ssh -M -N -f`를 제어 터미널 없이(`SSH_ASKPASS=ha_askpass.sh`, `SSH_ASKPASS_REQUIRE=force`, `DISPLAY=x`, `HA_ASKPASS_FIFO`). 명령줄 `-o`로 `ControlMaster=yes`, `ControlPersist=yes`, `BatchMode=no`, 고른 방법 하나, `NumberOfPasswordPrompts=1`만 덮어씀 | — | — |
+| 6 | FIFO를 `O_WRONLY|O_NONBLOCK`으로 엶(ENXIO면 기한 안에서 다시). 붙으면 비밀번호를 한 번 쓰고 닫음. ssh가 askpass를 부르지 않고 끝나면 기다리지 않고 원인을 가림. 기한 넘으면 ssh 프로세스 그룹을 끝냄 | 20초 | `auth_failed`, `port_timeout`, `ssh_failed` 등 |
+| 7 | 비밀번호를 준 뒤 askpass가 한 번 더 붙으면(일회용 코드, 만료 비밀번호 변경) 답하지 않고 ssh를 끝냄(FIFO는 ssh가 끝날 때까지 남겨 둠) | — | `auth_failed`(문구에 "비밀번호 말고 다른 것을 물음") |
+| 8 | FIFO 삭제, 메모리의 비밀번호 지움, `-O check` | 5초 | `auth_failed` |
+
+- 한 노드가 실패해도 다른 노드는 끝까지 확인하고, 하나라도 실패하면 로그인한 노드에 `-O exit` 한 뒤 거절. 실패한 노드에 다시 시도하지 않음(노드당 로그인 시도 한 번)
+- C3가 실패하면 스크립트를 띄우지 않고 `ha_add_nodes` 응답 자체가 failure(`note`, `error`, `message`, `action`, `node_checks[]`). `plan`·`run`은 작업 폴더를 남기지 않고 `rollback`·`cleanup`은 옛 작업 폴더를 건드리지 않음
+
+C4 앞 확인과 실행
+
+| 무엇을 | 방법 | 다르면 |
+|---|---|---|
+| `ha_add_nodes.sh`·`ha_node.sh`·`ha_askpass.sh`·`ha_watch.sh` sha256 | cub_manager 상수(CMake가 server/scripts에서 헤더 생성)와 비교 | `script_tampered` |
+| 소유자·권한 | 파일과 `/`까지 모든 상위 폴더가 CMS 계정 또는 root 소유, 그룹·다른 사용자 쓰기 없음 | `script_unsafe` |
+| 확인과 실행 사이 틈 | `ha_add_nodes.sh`는 CMS가 연 fd로 해시하고 그 fd(`/dev/fd/3`)로 실행. 스크립트는 `$0`으로 자기 위치를 찾지 않음(`$CUBRID/share/cms` 고정) | — |
+
+감시 셸 `ha_watch.sh`(스크립트 쪽이 작성, CMS가 띄움)
+
+- CMS가 `setsid ha_watch.sh --ssh-config <파일> --cp-dir <hs 폴더> -- <스크립트 인자>`를 fd 3에 `ha_add_nodes.sh`를 연 채로 띄움
+- 감시 셸: TERM·INT·HUP 무시 → `bash /dev/fd/3 "$@" &`(스크립트는 새 프로세스, 취소 신호는 지금처럼 job 파일의 스크립트 pid로만) → `wait` → 끝나면(SIGKILL 포함) 설정 파일의 `Host` 목록마다 `ssh -F <파일> -O exit <host>`, hs 폴더 삭제 → 끝
+- 감시 셸까지 죽은 경우: CMS가 상태 조회에서 `interrupted`를 볼 때, `rollback`·`cleanup`을 받을 때 작업 폴더에 적힌 옛 hs 폴더의 마스터에 `-O exit`
+
+#### 3.8.3 스크립트 쪽
+
+원격 실행(`on_node`)
+
+- 명령 문자열은 고정: `ssh -F "$SSH_CONFIG" -T <host> '<노드의 $CUBRID>/share/cms/ha_node.sh'`. 하위 명령과 인자는 표준 입력 앞부분에 보냄: 첫 값은 인자 개수, 그다음 인자마다 NUL로 끝남. `recv`의 파일 내용은 그 뒤에 이어짐. 원격 로그인 셸(csh·tcsh 포함)이 인자를 해석하지 않음
+- 노드의 `$CUBRID`는 S2 첫 확인(로그인 셸로 읽은 값, 3.4)으로 정함
+- 호출 전 `-O check`. 실패면 그 호출은 하지 않고 바로 `connection_lost`
+- 결과는 지금처럼 `@@BEGIN` / `@@END <종료 코드>` 사이만 읽음. 표준 오류는 따로 받아 마지막 한 줄을 오류 문구로 씀
+- 스크립트 본문 전체를 `main() { … }; main "$@"; exit $?`로 감쌈(bash는 실행 중 파일을 조금씩 읽으므로, 실행 중 같은 inode가 바뀌어도 영향이 없게). `ha_node.sh`도 같음
+
+결과 분류
+
+| 관찰 | 코드 | 되돌리기 |
+|---|---|---|
+| `@@END n` 있음 | 노드 동작의 결과(n = 0이면 성공) | 실패면 보통 되돌리기 |
+| 표시 없음 + ssh 255 + `-O check` 실패 | `connection_lost` | 그 명령이 오래 걸리거나 CUBRID 프로세스를 띄우는 것(restore, first_copylog, backup, heartbeat·server·cub_master, reload, repl)이면 `rollback_blocked`(노드에서 아직 돌 수 있음). 아니면 되돌리기, 그 노드 줄은 `unrestored`(다시 로그인하지 않으므로) |
+| 표시 없음 + ssh 255 + `-O check` 성공 | `ssh_failed` + 표준 오류 마지막 줄(채널 열기 실패, MaxSessions 등) | 보통 되돌리기 |
+| 표시 없음 + 다른 종료 코드 | `ssh_failed` + 표준 오류 마지막 줄 | 보통 되돌리기 |
+| 로컬 제한 시간 초과 | 지금과 같음(`no_response` / `no_answer`) | 2.1·2.6 |
+
+S2 노드 확인 순서(127 겹침 해소)
+
+1. 셸 확인: `ssh … -T <host> true`. 0이면 다음. "This account is currently not available"(종료 코드 1)이면 `account_no_shell`, 126·127이면 `remote_shell_failed`
+2. `$CUBRID` 읽기: 로그인 셸로 값 읽기(3.4). 비면 `cubrid_not_found`
+3. `ha_node.sh version`: 127이면 `node_script_missing`. `SCRIPT_VERSION`(스크립트 버전 + 빌드 식별자)이 다르면 `node_script_version_mismatch`, 같은데 `SELF_SHA256`이 CMS 기준값과 다르면 `node_script_tampered`, `OWNER`·`MODE`(파일과 `/`까지 상위 폴더)가 느슨하면 `node_script_unsafe`, `CUBRID_VERSION`이 다르면 `version_mismatch`
+4. 결과를 `node_checks` 파일의 그 노드 줄에 씀(임시 파일 + mv)
+
+- 접속 횟수: S2 확인은 C3가 연 마스터 위에서 하므로 새 TCP 접속·인증이 늘지 않음. `ha_check_ssh`와 C3의 keyscan 중복은 남음(fail2ban은 [하])
+
+`ha_node.sh` 인자 허용 목록(노드 안에서 확인, 어기면 그 하위 명령은 아무것도 하지 않고 실패)
+
+| 대상 | 허용 |
+|---|---|
+| 작업 번호 | 모든 호출의 첫 인자 `--job <uuid>`(16진수). 아래 "작업 표시"는 이 값으로 만듦 |
+| 설정 파일(`conf_edit`, `undo_file`, `drop_backups`, `dbtxt_*`) | `$CUBRID/conf/cubrid.conf`, `$CUBRID/conf/cubrid_ha.conf`, `$CUBRID_DATABASES/databases.txt`와 그 `.bak.<uuid>.<번호>`·`.new.<uuid>.<번호>`뿐. `$CUBRID`·`$CUBRID_DATABASES`는 노드 자신의 로그인 환경 값 |
+| 절·키·값 | 절은 `[common]` 또는 `[@<DB 이름>]`, 키는 `[a-z_]+`, 값은 `[A-Za-z0-9@:,._/-]*` |
+| `recv`, 받는 폴더 `mkdir` | `<받는 폴더>/ha_add_nodes_backup/<uuid>/` 아래(`..` 없음, 실제 경로 확인) |
+| `move_back`, `remove`, `clear`, `rmdir_empty` | 작업 표시가 있는 경로(`*.ha_add_nodes_<uuid>`, `…/ha_add_nodes_backup/<uuid>…`), 또는 `ha_node.sh`가 노드의 `databases.txt`·`cubrid_ha.conf`에서 직접 계산한 D의 볼륨·로그 폴더와 복제 로그 폴더(`<복제 로그 위치>/<D>_<노드>`). `rmdir_empty`는 받는 폴더와 복제 로그 위치도 됨(비었을 때만 지워짐) |
+| `keep_old` | D 이름과 HA 노드 이름만 받고 경로는 노드가 계산 |
+| 범용 실행 | 없음 |
+
+오류 문구
+
+- `auth_failed`: "비밀번호가 틀렸거나, 계정이 잠겼거나(faillock), 로그인이 허용되지 않은 계정(AllowUsers·DenyUsers, pam_access)이거나, 비밀번호가 만료됐거나, 인증 시도 횟수 제한(MaxAuthTries)에 걸렸음". 할 일: "비밀번호를 확인하고, 맞다면 그 노드 관리자에게 계정 잠김·접속 허용 여부를 확인"
+- `ssh_failed`: 다른 코드에 들지 않는 ssh 실패. 문구에 ssh 표준 오류 원문 한 줄(예: 키 교환·암호 협상 실패, No route to host, Network is unreachable, Connection reset by peer, Too many authentication failures)
+- `account_no_shell`: 그 계정의 로그인 셸이 로그인을 막음(nologin). 할 일: 로그인 셸 확인
+
+#### 3.8.4 실패 목록표에 바뀌는 것
+
+- 2.1의 "되돌리기에서 그 노드에 다시 접속(헬퍼가 새 세션)"은 v5에서 성립하지 않음: 끊긴 노드는 그 실행에서 다시 접속하지 않고 `unrestored`로 남김. 사용자가 비밀번호를 다시 넣어 `rollback`(화면 기본 흐름)
+- S13·S14(또는 다른 오래 걸리는 명령) 중 `connection_lost`는 `rollback_blocked`(원격 restoreslave가 계속 돌 수 있음. v4에서 이미 같게 고침)
+- 2.15에 `ssh_failed`, `account_no_shell` 추가
