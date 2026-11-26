@@ -1648,7 +1648,9 @@ namespace
 		  }
 		else if (state == GIVEN_AND_READ)
 		  {
+		    /* ssh goes first, askpass with it: an empty answer must not reach the node as a second try */
 		    asked_more = true;
+		    kill (-pid, SIGKILL);
 		  }
 		close (w);
 	      }
@@ -1787,6 +1789,27 @@ namespace
     find_ssh_tools (&t, &missing);
     remove_control_dir (t, trim (d));
     unlink ((dir + "/control_dir").c_str ());
+  }
+
+  /*
+   * The same for a job that is over, whatever way it ended: its watcher normally did this already. Not while
+   * a new run of the job is starting: that run's folder is written after the job's last state, and its script
+   * has not written a state yet (unless it has been that way for a minute: then it never started).
+   */
+  void end_finished_masters (const string &dir)
+  {
+    struct stat cs, js;
+    if (stat ((dir + "/control_dir").c_str (), &cs) != 0)
+      {
+	return;
+      }
+    bool newer_than_job = stat ((dir + "/job").c_str (), &js) != 0 || cs.st_mtim.tv_sec > js.st_mtim.tv_sec
+			  || (cs.st_mtim.tv_sec == js.st_mtim.tv_sec && cs.st_mtim.tv_nsec > js.st_mtim.tv_nsec);
+    if (newer_than_job && time (NULL) - cs.st_mtim.tv_sec < 60)
+      {
+	return;
+      }
+    end_old_masters (dir);
   }
 
   struct login_set
@@ -2643,7 +2666,10 @@ ext_ha_add_nodes_status (Json::Value &request, Json::Value &response)
   if (status == "running" && proc_start ((pid_t) atoi (job["pid"].c_str ())) != job["pid_start"])
     {
       status = "interrupted";	/* the script is gone without finishing: `rollback` can undo what it did */
-      end_old_masters (dir);	/* and its watcher may be gone with it */
+    }
+  if (status != "running")
+    {
+      end_finished_masters (dir);	/* the watcher does this when the script ends, unless it died itself */
     }
   response["uuid"] = uuid;
   response["action"] = job["action"];
