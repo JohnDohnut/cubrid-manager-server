@@ -96,48 +96,16 @@ message(STATUS "CUBRID Manager server version: ${CMS_BUILD_NUMBER}")
 # In-tree: take them straight from the targets this build defines.
 # Standalone: CUBRID_INCLUDE_DIR / CUBRID_LIB_DIR / OPENSSL_* are resolved by
 # build_cmake.sh (or passed by hand) and pointed at a build or install tree.
-include(ExternalProject)
-set(CMS_3RDPARTY_DIR ${CMAKE_CURRENT_BINARY_DIR}/3rdparty)
 if(CMS_STANDALONE)
-  # Off: OPENSSL_* point at the OpenSSL of a CUBRID build tree (build_cmake.sh).
-  # On: OpenSSL is built here from the same tarball and hash the engine's 3rdparty uses, for building
-  # against an installed CUBRID, which ships no OpenSSL to link with.
-  option(CMS_STATIC_OPENSSL "Build OpenSSL from source and link it statically (ignores OPENSSL_*)" OFF)
-  set(CMS_REQUIRED CUBRID_INCLUDE_DIR CUBRID_LIB_DIR)
-  if(NOT CMS_STATIC_OPENSSL)
-    list(APPEND CMS_REQUIRED OPENSSL_INCLUDE_DIR OPENSSL_LIBRARIES)
-  endif()
-  foreach(required ${CMS_REQUIRED})
+  foreach(required CUBRID_INCLUDE_DIR CUBRID_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_LIBRARIES)
     if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
       message(FATAL_ERROR
         "${required} is not set. Run build_cmake.sh, or pass -D${required}=... pointing at a CUBRID build or installation.")
     endif()
   endforeach()
   set(CMS_CUBRID_INCLUDES ${CUBRID_INCLUDE_DIR})
-  if(CMS_STATIC_OPENSSL)
-    ExternalProject_Add(cms_openssl
-      URL                  "https://github.com/CUBRID/3rdparty/raw/develop/openssl/openssl-3.5.7.tar.gz"
-      URL_HASH             "SHA256=a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8"
-      PREFIX               ${CMS_3RDPARTY_DIR}/openssl
-      LOG_CONFIGURE TRUE LOG_BUILD TRUE LOG_INSTALL TRUE
-      TIMEOUT 1800 INACTIVITY_TIMEOUT 60 DOWNLOAD_NO_PROGRESS 1
-      # OPENSSLDIR points where no customer machine has an openssl.cnf, so nothing is read from the system
-      CONFIGURE_COMMAND    <SOURCE_DIR>/config --prefix=${CMS_3RDPARTY_DIR} --libdir=lib --openssldir=/nonexistent/cubrid-cm-ssh no-shared no-module no-tests no-docs
-      BUILD_COMMAND        make -j4 build_sw
-      # a plain make under the parent "make -j" fails with "write jobserver: Bad file descriptor"
-      INSTALL_COMMAND      ${CMAKE_COMMAND} -E env MAKEFLAGS= MFLAGS= make install_sw
-      BUILD_BYPRODUCTS     ${CMS_3RDPARTY_DIR}/lib/libssl.a ${CMS_3RDPARTY_DIR}/lib/libcrypto.a
-      )
-    set(CMS_OPENSSL_TARGET cms_openssl)
-    set(CMS_OPENSSL_ROOT ${CMS_3RDPARTY_DIR})
-    set(CMS_OPENSSL_INCLUDES ${CMS_3RDPARTY_DIR}/include)
-    set(CMS_OPENSSL_LIBS ${CMS_3RDPARTY_DIR}/lib/libssl.a ${CMS_3RDPARTY_DIR}/lib/libcrypto.a)
-  else()
-    set(CMS_OPENSSL_TARGET "")
-    get_filename_component(CMS_OPENSSL_ROOT ${OPENSSL_INCLUDE_DIR} DIRECTORY)
-    set(CMS_OPENSSL_INCLUDES ${OPENSSL_INCLUDE_DIR})
-    set(CMS_OPENSSL_LIBS ${OPENSSL_LIBRARIES})
-  endif()
+  set(CMS_OPENSSL_INCLUDES ${OPENSSL_INCLUDE_DIR})
+  set(CMS_OPENSSL_LIBS ${OPENSSL_LIBRARIES})
   find_library(CMS_CUBRIDCS_LIB NAMES cubridcs PATHS ${CUBRID_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
   find_library(CMS_CMDEP_LIB NAMES cmdep PATHS ${CUBRID_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
   find_library(CMS_CMSTAT_LIB NAMES cmstat PATHS ${CUBRID_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
@@ -159,35 +127,7 @@ else()
   set(CMS_CUBRID_LIBS cubridcs cmdep cmstat)
   set(CMS_OPENSSL_INCLUDES ${LIBOPENSSL_INCLUDES})
   set(CMS_OPENSSL_LIBS ${LIBOPENSSL_LIBS})
-  set(CMS_OPENSSL_TARGET ${LIBOPENSSL_TARGET})
-  set(CMS_OPENSSL_ROOT ${3RDPARTY_LIBS_DIR})
 endif()
-
-# libssh2 (BSD-3-Clause) for cm_ssh, the ssh/sftp helper of the HA node-adding script. Built from source and
-# linked statically against the same OpenSSL; nothing of ssh is taken from the system.
-ExternalProject_Add(cms_libssh2
-  URL                  "https://github.com/libssh2/libssh2/releases/download/libssh2-1.11.1/libssh2-1.11.1.tar.gz"
-  URL_HASH             "SHA256=d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7"
-  PREFIX               ${CMS_3RDPARTY_DIR}/libssh2
-  DEPENDS              ${CMS_OPENSSL_TARGET}
-  LOG_CONFIGURE TRUE LOG_BUILD TRUE LOG_INSTALL TRUE
-  TIMEOUT 600 INACTIVITY_TIMEOUT 60 DOWNLOAD_NO_PROGRESS 1
-  CMAKE_ARGS
-    -DCMAKE_INSTALL_PREFIX=${CMS_3RDPARTY_DIR}/ssh2
-    -DCMAKE_INSTALL_LIBDIR=lib
-    -DCMAKE_BUILD_TYPE=Release
-    -DBUILD_SHARED_LIBS=OFF
-    -DBUILD_STATIC_LIBS=ON
-    -DBUILD_EXAMPLES=OFF
-    -DBUILD_TESTING=OFF
-    -DENABLE_ZLIB_COMPRESSION=OFF
-    -DCRYPTO_BACKEND=OpenSSL
-    -DOPENSSL_ROOT_DIR=${CMS_OPENSSL_ROOT}
-    -DOPENSSL_USE_STATIC_LIBS=ON
-  BUILD_BYPRODUCTS     ${CMS_3RDPARTY_DIR}/ssh2/lib/libssh2.a
-  )
-set(CMS_LIBSSH2_INCLUDES ${CMS_3RDPARTY_DIR}/ssh2/include)
-set(CMS_LIBSSH2_LIBS ${CMS_3RDPARTY_DIR}/ssh2/lib/libssh2.a)
 
 # jsoncpp and libevent stay as the prebuilt archives committed under external/.
 # libevent_openssl only references OpenSSL's stable public API, so it links against
@@ -264,7 +204,26 @@ set(CUB_MANAGER_SOURCES
   ${CMS_SRC_DIR}/cm_log_name.cpp
   ${CMS_SRC_DIR}/cm_task_file.cpp
   ${CMS_SRC_DIR}/cm_ha_add_nodes.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/cm_ha_script_hash.h
   )
+
+# The HA node-adding scripts. The manager runs them from their installed place only, and only when they are
+# the files of this build: their sha256 is built into cub_manager (cm_ha_script_hash.h).
+set(CMS_HA_SCRIPT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/scripts CACHE PATH "Folder of the HA node-adding scripts")
+set(CMS_HA_SCRIPTS ha_add_nodes.sh ha_node.sh ha_askpass.sh ha_watch.sh)
+set(CMS_HA_SCRIPT_FILES "")
+foreach(script ${CMS_HA_SCRIPTS})
+  if(EXISTS ${CMS_HA_SCRIPT_DIR}/${script})
+    list(APPEND CMS_HA_SCRIPT_FILES ${CMS_HA_SCRIPT_DIR}/${script})
+  endif()
+endforeach()
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/cm_ha_script_hash.h
+  COMMAND ${CMAKE_COMMAND} -DSCRIPT_DIR=${CMS_HA_SCRIPT_DIR} "-DSCRIPTS=${CMS_HA_SCRIPTS}"
+          -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cm_ha_script_hash.h
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ha_script_hash.cmake
+  DEPENDS ${CMS_HA_SCRIPT_FILES} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ha_script_hash.cmake
+  VERBATIM)
 
 add_executable(cm_admin ${CM_ADMIN_SOURCES})
 target_compile_definitions(cm_admin PRIVATE
@@ -272,10 +231,8 @@ target_compile_definitions(cm_admin PRIVATE
 target_compile_options(cm_admin PRIVATE ${CMS_WARN_FLAGS})
 target_include_directories(cm_admin PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR} ${CMS_SRC_DIR} ${CMS_CUBRID_INCLUDES} ${CMS_OPENSSL_INCLUDES})
-# OpenSSL goes before the CUBRID libraries: libcubridcs of released engines (11.4.5) exports its own bundled
-# OpenSSL 1.1.1, and a library listed first would take this program's OpenSSL calls.
 target_link_libraries(cm_admin PRIVATE
-  ${CMS_OPENSSL_LIBS} ${CMS_CUBRID_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+  ${CMS_CUBRID_LIBS} ${CMS_OPENSSL_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
 
 add_executable(cub_manager ${CUB_MANAGER_SOURCES})
 target_compile_definitions(cub_manager PRIVATE
@@ -289,31 +246,17 @@ target_include_directories(cub_manager PRIVATE
 # headers of the very library it links, which was not the case before.
 # ${CMAKE_DL_LIBS} is for the static libcrypto, which calls dlopen/dlclose. In-tree it
 # comes along with libcubridcs; a standalone build has to ask for it.
-# OpenSSL before the CUBRID libraries, for the reason given at cm_admin; its symbols are not exported either,
-# so the two copies cannot get mixed in one process.
 target_link_libraries(cub_manager PRIVATE
-  ${CMS_EXTERNAL_LIBS} ${CMS_OPENSSL_LIBS} ${CMS_CUBRID_LIBS}
+  ${CMS_CUBRID_LIBS} ${CMS_EXTERNAL_LIBS} ${CMS_OPENSSL_LIBS}
   Threads::Threads ${CMAKE_DL_LIBS} rt util)
-target_link_options(cub_manager PRIVATE "-Wl,--exclude-libs,libssl.a:libcrypto.a")
 
 # The committed jsoncpp and libevent archives were built without -fPIC, so this has to
 # be a non-PIE executable - which is what the automake build produced as well.
 target_link_options(cub_manager PRIVATE -no-pie)
 
-# cm_ssh: ssh and sftp for the HA node-adding script. It links no CUBRID library.
-add_executable(cm_ssh ${CMS_SRC_DIR}/cm_ssh.cpp)
-target_compile_definitions(cm_ssh PRIVATE _GNU_SOURCE _FILE_OFFSET_BITS=64)
-target_compile_options(cm_ssh PRIVATE ${CMS_WARN_FLAGS})
-target_include_directories(cm_ssh BEFORE PRIVATE ${CMS_LIBSSH2_INCLUDES} ${CMS_OPENSSL_INCLUDES})
-# rt: clock_gettime lives in librt on glibc older than 2.17 (the official build image has 2.12)
-target_link_libraries(cm_ssh PRIVATE ${CMS_LIBSSH2_LIBS} ${CMS_OPENSSL_LIBS} Threads::Threads ${CMAKE_DL_LIBS} rt)
-target_link_options(cm_ssh PRIVATE "-Wl,--exclude-libs,libssl.a:libcrypto.a:libssh2.a")
-add_dependencies(cm_ssh cms_libssh2)
-
-if(CMS_OPENSSL_TARGET)
-  add_dependencies(cm_admin ${CMS_OPENSSL_TARGET})
-  add_dependencies(cub_manager ${CMS_OPENSSL_TARGET})
-  add_dependencies(cm_ssh ${CMS_OPENSSL_TARGET})
+if(NOT CMS_STANDALONE)
+  add_dependencies(cm_admin ${LIBOPENSSL_TARGET})
+  add_dependencies(cub_manager ${LIBOPENSSL_TARGET})
 endif()
 
 # ---------------------------------------------------------------------------- install
@@ -321,25 +264,22 @@ if(CMS_STANDALONE)
   set(CMS_BINDIR bin)
   set(CMS_CONFDIR conf)
   set(CMS_SHAREDIR share)
-  set(CMS_LICENSEDIR 3rdparty)
 else()
   set(CMS_BINDIR ${CUBRID_BINDIR})
   set(CMS_CONFDIR ${CUBRID_CONFDIR})
   set(CMS_SHAREDIR ${CUBRID_DATADIR})
-  set(CMS_LICENSEDIR ${CUBRID_3RDPARTYDIR})
 endif()
 
-install(TARGETS cm_admin cub_manager cm_ssh
+install(TARGETS cm_admin cub_manager
   RUNTIME DESTINATION ${CMS_BINDIR} COMPONENT Manager)
 
-# The HA node-adding script; the manager runs it from this fixed place only.
-install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ha_add_nodes.sh
-  DESTINATION ${CMS_SHAREDIR}/cms COMPONENT Manager)
-
-# libssh2 is BSD-3-Clause: its copyright notice, conditions and disclaimer go with the binaries, next to the
-# license texts of the engine's 3rdparty libraries.
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/license/libssh2_license.txt
-  DESTINATION ${CMS_LICENSEDIR} COMPONENT Manager)
+# The HA node-adding scripts: ha_add_nodes.sh runs on the server the manager is on, ha_node.sh on every node
+# (so every node needs this package), ha_askpass.sh hands the ssh client a node's password once, and
+# ha_watch.sh logs out of the nodes when ha_add_nodes.sh ends.
+foreach(script ${CMS_HA_SCRIPTS})
+  install(PROGRAMS ${CMS_HA_SCRIPT_DIR}/${script}
+    DESTINATION ${CMS_SHAREDIR}/cms COMPONENT Manager)
+endforeach()
 
 file(GLOB CMS_CONF_FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmserver/conf/*.conf
                          ${CMAKE_CURRENT_SOURCE_DIR}/cmserver/conf/*.pass)
