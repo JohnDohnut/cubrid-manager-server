@@ -293,7 +293,7 @@ target_include_directories(cub_manager PRIVATE
 # so the two copies cannot get mixed in one process.
 target_link_libraries(cub_manager PRIVATE
   ${CMS_EXTERNAL_LIBS} ${CMS_OPENSSL_LIBS} ${CMS_CUBRID_LIBS}
-  Threads::Threads ${CMAKE_DL_LIBS} rt)
+  Threads::Threads ${CMAKE_DL_LIBS} rt util)
 target_link_options(cub_manager PRIVATE "-Wl,--exclude-libs,libssl.a:libcrypto.a")
 
 # The committed jsoncpp and libevent archives were built without -fPIC, so this has to

@@ -136,6 +136,7 @@
   ],
   "repl_log_home": "", "backup_path": "", "remote_backup_path": "",
   "ha_group": "cubrid", "ha_port_id": 59901,     // 승격할 때만
+  "db_accounts": [{"db": "db1", "user": "dba", "password": "..."}],  // plan에만, 선택(기본 키 확인)
   "rollback_convert": "no", "start_ha": "yes"
 }
 ```
@@ -152,6 +153,7 @@
 | `ha_group` | `--ha-group` | `cubrid` | 승격할 때만: 새 `ha_node_list`의 그룹 이름. HA면 쓰지 않음(M의 값) |
 | `ha_port_id` | `--ha-port-id` | `59901` | 승격할 때만: `ha_port_id`. HA면 쓰지 않음(M의 값을 새 노드에 옮김) |
 | `confirm_new_node_db_restart` | `--confirm-new-node-db-restart` | 없음 | 새 노드에 다른 DB가 떠 있을 때 필요(2.6). 없으면 거절 |
+| `db_accounts` | 없음(CMS만 씀) | 없음 | `plan`에만 싣는 선택 항목. 화면이 지금 로그인이 살아 있는 DB의 계정만 붙임. CMS가 그 계정으로 기본 키 없는 표를 확인함(10절). 비밀번호는 스크립트·작업 폴더·로그로 가지 않음. `run`에는 싣지 않음 |
 | `start_ha` | `--no-start-ha`(no일 때) | `yes` | `no`면 새 노드 HA 시작·확인을 하지 않음 |
 | `rollback_convert` | `--rollback-convert`(yes일 때) | `no` | 승격 뒤 단계에서 실패하면 싱글까지 되돌릴지 |
 
@@ -262,7 +264,7 @@ ha_add_nodes.sh <plan|run|cleanup|rollback> --job-dir <작업 폴더> --agent <�
 
 | 묶음 | no | id | 단위 | 주체·대상 | 하는 일(명령) | 앞 조건 | 되돌리기 |
 |---|---|---|---|---|---|---|---|
-| A 사전 확인 | S1 | `precheck` | 1 | SC @L | 인자 검사, L의 상태(싱글/마스터/슬레이브/레플리카), `ha_db_list`, 두 목록과 기존 노드 입력 대조, 백업 자리(`df`), 자동 작업·기본 키 경고. 아무것도 만들지 않음 | C4 | 없음 |
+| A 사전 확인 | S1 | `precheck` | 1 | SC @L | 인자 검사, L의 상태(싱글/마스터/슬레이브/레플리카), `ha_db_list`, 두 목록과 기존 노드 입력 대조, 백업 자리(`df`), 자동 작업 경고, 기본 키 확인 결과(CMS가 `plan` 전에 `db_accounts`로 확인해 둔 것)를 DB마다 경고로. 아무것도 만들지 않음 | C4 | 없음 |
 | | S2 | `node_check [노드]` | 노드(E, X, Y) | SC → H @노드 | 로그인, `uname -n`, CUBRID 경로·버전, 모든 노드 이름이 풀리는지. E: D의 상태(M active, S·R standby), 두 목록이 M과 같은지(순서 포함). X·Y: D가 꺼져 있는지, 그 노드의 다른 DB(등록된 것·떠 있는 것), 노드 기준 경로 계산(2.5) | S1 | 없음 |
 | | S3 | `preflight [노드]` | 노드(L, X, Y) | SC(@L), SC → H | 승격 전 사전 점검. L: 백업 폴더 쓰기 시험. X·Y: 받는 폴더·복원 대상 경로·복제 로그 폴더 쓰기 시험, 받는 폴더 여유(백업 크기), 작은 파일 전송·삭제 시험(시험 폴더는 바로 지움) | S2 | 없음(남기는 것 없음) |
 | B 승격(싱글만) | S4 | `convert_stop` | 1 | SC @L | 떠 있는 DB 전부 `cubrid server stop` | S3 | 처음에 떠 있던 DB를 싱글로 기동 |
@@ -444,12 +446,17 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
   "changes": [{"host": "nodeS1", "file": "cubrid_ha.conf", "key": "ha_node_list", "before": "...", "after": "..."}, ...],
   "backup_bytes": 0, "transfer_bytes": 0,
   "process_increase": [{"host": "nodeS1", "copylogdb": 2, "applylogdb": 2}, ...],
+  "primary_key_check": [{"db": "db1", "status": "ok|partial|failed|not_logged_in", "tables": ["DBA.t9"], "message": ""}, ...],
   "warnings": ["..."],
   "steps": [{"no": 1, "stage": "S1", "id": "precheck", "title": "...", "node": "", "db": "", "actor": "script"}, ...]
 }
 ```
 
-- 기본 키 없는 표 경고: HA는 기본 키가 없는 표를 복제하지 않음. 목록을 내려면 DB에 로그인해야 하나 스크립트는 DB 계정을 받지 않음. 안: 화면이 이미 로그인해 둔 DB 계정(NCA의 DB 로그인 정보)을 `plan` 요청에 실어 보내면 CMS가 그 계정으로 카탈로그를 조회해(기본 키가 없는 사용자 표) `plan.warnings`에 넣음. 계정이 없으면 "기본 키 없는 표: 확인 못 함(DB 계정 없음)" 경고만 냄(지금 구현).
+- 기본 키 없는 표 확인: HA는 기본 키가 없는 표를 복제하지 않음.
+  - `plan` 요청의 `db_accounts[]`(db, user, password)로 CMS가 DB마다 카탈로그를 조회함(`db_class`에서 기본 키 인덱스가 없는 사용자 표). 결과만 작업 폴더에 남기고 스크립트가 `plan`에 넣음.
+  - 비밀번호 경로: csql은 표준 입력이 터미널일 때만 비밀번호를 물으므로(소스), CMS가 가상 터미널(pty)로 csql을 띄우고 프롬프트에 비밀번호를 씀. 명령줄 인자·환경 변수·파일에 넣지 않음. 다시 물으면(틀린 비밀번호) 바로 끝냄.
+  - `plan.primary_key_check[]`: `db`, `status`(`ok` / `partial`: dba가 아니라 다른 사용자 표는 못 봄 / `failed`: 로그인·조회 실패 / `not_logged_in`: 계정이 오지 않음), `tables`(소유자.표), `message`. 같은 내용을 `warnings[]`에도 DB 이름과 함께 넣음.
+  - 실측: dba로 기본 키 없는 표 2개를 찾음, 비밀번호가 있는 일반 계정은 `partial`과 자기 표, 틀린 비밀번호는 `failed`(login failed), 계정 없는 DB는 `not_logged_in`. 작업 폴더·CMS 로그에 비밀번호 없음.
 - `ha_check_ssh`의 첫 호출(지문 받기)은 화면이 노드마다 부름. 사용자가 지문을 확인한 뒤 그 지문을 `hostkey_sha256`으로 넘김.
 - CMS가 스크립트를 부르기 전에 확인하는 것: 스크립트·헬퍼가 정해진 경로의 일반 파일이고 그룹·다른 사용자가 쓸 수 없는지.
 - 이전 POC의 `ha_convert_master`·`ha_make_slave*` task는 이 API로 바뀜.

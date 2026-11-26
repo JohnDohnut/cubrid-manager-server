@@ -657,7 +657,7 @@ LOCAL_STATE="" CASE_NO=0 VERSION=""
 D=() NODE_LIST="" REPLICA_LIST="" SYNC_MODE="" HA_CONF_LOCAL="" UP_BEFORE=() OTHERS_UP=() SINGLES=()
 SRC_STATE=master
 NEW_SLAVES=() NEW_REPLICAS=()
-declare -A DB_VOL=() DB_LOG=() DB_LOB=() DB_HOSTS=()
+declare -A DB_VOL=() DB_LOG=() DB_LOB=() DB_HOSTS=() PK_STATUS=() PK_TABLES=() PK_MSG=()
 WARN=()
 
 st_precheck() {
@@ -738,9 +738,20 @@ st_precheck() {
       WARN+=("$db has automatic backup or volume adding set in the manager; avoid running them while this job runs")
     fi
   done
-  # HA replicates only tables with a primary key; listing the others needs a database login, which this
-  # script does not get (the manager can check with the database account the screen logged in with)
-  WARN+=("tables without a primary key are not replicated; not checked here (no database account): ${D[*]}")
+  # HA replicates only tables with a primary key. The manager checks with the database logins of the screen
+  # (pk_check in the job folder: "db<TAB>ok|partial|failed<TAB>tables or message"); this script gets no password.
+  local st rest
+  for db in "${D[@]}"; do
+    IFS=$'\t' read -r _ st rest < <(awk -F'\t' -v d="$db" '$1 == d' "$JOB_DIR/pk_check" 2>/dev/null)
+    case ${st:-} in
+      ok) PK_STATUS[$db]=ok; PK_TABLES[$db]=$rest
+          [ -n "$rest" ] && WARN+=("$db: tables without a primary key are not replicated: $rest") ;;
+      partial) PK_STATUS[$db]=partial; PK_TABLES[$db]=$rest
+          WARN+=("$db: not a dba account, only part of the tables checked${rest:+; without a primary key: $rest}") ;;
+      failed) PK_STATUS[$db]=failed; PK_MSG[$db]=$rest; WARN+=("$db: primary keys not checked ($rest)") ;;
+      *) PK_STATUS[$db]=not_logged_in; WARN+=("$db: primary keys not checked (not logged in)") ;;
+    esac
+  done
   BK_PATH=${BK_PATH:-$CUBRID_DATABASES/ha_add_nodes_backup}
   # backup room here: the size of the databases' volumes
   local need=0 free sz
@@ -1363,6 +1374,13 @@ write_plan() {
     done
     for h in "${NEW_HOST[@]}"; do
       printf ',{"host":%s,"file":"cubrid_ha.conf","key":"ha_node_list","before":"","after":%s}' "$(json_str "$h")" "$(json_str "$final_n")"
+    done
+    printf '],"primary_key_check":['
+    first=1
+    for db in "${D[@]}"; do
+      [ $first = 1 ] || printf ','; first=0
+      printf '{"db":%s,"status":%s,"tables":%s,"message":%s}' "$(json_str "$db")" "$(json_str "${PK_STATUS[$db]:-not_logged_in}")" \
+        "$(json_arr ${PK_TABLES[$db]:-})" "$(json_str "${PK_MSG[$db]:-}")"
     done
     printf '],"backup_bytes":%s,"transfer_bytes":%s,' "${JOB[backup_bytes]:-0}" "$(( ${JOB[backup_bytes]:-0} * ${#NEW_HOST[@]} ))"
     local nn

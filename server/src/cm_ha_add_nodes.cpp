@@ -44,6 +44,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <pty.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -653,6 +654,106 @@ namespace
     return kv;
   }
 
+  /*
+   * Tables without a primary key in one database (HA does not replicate them), read with the account the screen
+   * logged in with. csql asks for a password only on a terminal, so it runs on a pseudo terminal and the password
+   * is typed at its prompt: it never goes into an argument, the environment or a file.
+   * returns "ok", "partial" (not dba: other users' tables are not visible) or "failed"; *tables: owner.name list
+   */
+  string pk_check (const string &db, const string &user, string &password, string *tables, string *msg)
+  {
+    const char *q = "select 'PKCHK|' || c.owner_name || '.' || c.class_name from db_class c where c.is_system_class = 'NO'"
+		    " and c.class_type = 'CLASS' and not exists (select 1 from db_index i where i.class_name = c.class_name"
+		    " and i.is_primary_key = 'YES');";
+    string csql = cubrid_dir () + "/bin/csql";
+    string target = db + "@localhost";
+    int master = -1;
+    pid_t pid = forkpty (&master, NULL, NULL, NULL);
+    if (pid < 0)
+      {
+	*msg = "cannot open a pseudo terminal";
+	return "failed";
+      }
+    if (pid == 0)
+      {
+	long maxfd = sysconf (_SC_OPEN_MAX);
+	for (long fd = 3; fd < (maxfd > 0 && maxfd < 65536 ? maxfd : 65536); fd++)
+	  {
+	    close ((int) fd);
+	  }
+	execl (csql.c_str (), csql.c_str (), "-u", user.c_str (), target.c_str (), (char *) NULL);
+	_exit (127);
+      }
+    string out;
+    bool sent_pw = false, sent_q = false;
+    time_t end = time (NULL) + 30;
+    char buf[4096];
+    while (time (NULL) < end)
+      {
+	if (!sent_pw && out.find ("assword") != string::npos)
+	  {
+	    string line = password + "\n";
+	    ssize_t w = write (master, line.data (), line.size ());
+	    (void) w;
+	    wipe (line);
+	    sent_pw = true;
+	  }
+	if (sent_pw && out.find ("assword", out.find ("assword") + 7) != string::npos)
+	  {
+	    break;		/* asked again: the password was wrong */
+	  }
+	if (!sent_q && out.find ("csql>") != string::npos)
+	  {
+	    string line = string (q) + "\n;exit\n";
+	    ssize_t w = write (master, line.data (), line.size ());
+	    (void) w;
+	    sent_q = true;
+	  }
+	struct pollfd pf = { master, POLLIN, 0 };
+	if (poll (&pf, 1, 500) <= 0)
+	  {
+	    continue;
+	  }
+	ssize_t n = read (master, buf, sizeof (buf));
+	if (n <= 0)
+	  {
+	    break;		/* csql ended */
+	  }
+	out.append (buf, (size_t) n);
+      }
+    wipe (password);
+    kill (pid, SIGKILL);
+    close (master);
+    waitpid (pid, NULL, 0);
+    if (!sent_q)
+      {
+	*msg = sent_pw ? "login failed" : "csql did not start";
+	return "failed";
+      }
+    /* result rows look like  'PKCHK|PUBLIC.t1' ; the echoed query has 'PKCHK|' with nothing after the bar */
+    size_t pos = 0;
+    while ((pos = out.find ("'PKCHK|", pos)) != string::npos)
+      {
+	size_t b = pos + 7, e = out.find ('\'', b);
+	if (e != string::npos && e > b)
+	  {
+	    *tables += (tables->empty () ? "" : " ") + out.substr (b, e - b);
+	  }
+	pos = b;
+      }
+    if (out.find ("ERROR") != string::npos && tables->empty ())
+      {
+	*msg = "the query failed";
+	return "failed";
+      }
+    string u = user;
+    for (char &c : u)
+      {
+	c = (char) toupper ((unsigned char) c);
+      }
+    return u == "DBA" ? "ok" : "partial";
+  }
+
   string quick_version ()
   {
     string out;
@@ -992,6 +1093,31 @@ ext_ha_add_nodes (Json::Value &request, Json::Value &response)
 	}
       std::ofstream out ((dir + "/args").c_str ());
       out << saved;
+    }
+  if (action == "plan" && request["db_accounts"].isArray ())
+    {
+      /* primary key check with the screen's database logins: results only (no password) go to the job folder */
+      string lines;
+      Json::Value &acc = request["db_accounts"];
+      for (Json::UInt i = 0; i < acc.size (); i++)
+	{
+	  Json::Value &a = acc[i];
+	  string db = req_str (a, "db"), user = req_str (a, "user"), pw;
+	  if (a["password"].isString ())
+	    {
+	      pw = a["password"].asString ();
+	      a["password"] = "";
+	    }
+	  if (!valid_name (db) || !valid_name (user) || pw.find ('\n') != string::npos)
+	    {
+	      wipe (pw);
+	      continue;
+	    }
+	  string tables, msg, st = pk_check (db, user, pw, &tables, &msg);
+	  lines += db + "\t" + st + "\t" + (st == "failed" ? msg : tables) + "\n";
+	}
+      std::ofstream pk ((dir + "/pk_check").c_str ());
+      pk << lines;
     }
   string sock = dir + "/agent." + std::to_string ((long) time (NULL)) + ".sock";
   string err = start_agent (dir, sock, all);
