@@ -1225,6 +1225,25 @@ ext_ha_add_nodes_status (Json::Value &request, Json::Value &response)
     }
   response["unrestored"] = unrestored;
 
+  /* what the preflight (S3) found, one entry per node and path */
+  Json::Value pf (Json::arrayValue);
+  std::istringstream ps (state_of (dir, "preflight_failures"));
+  string pl;
+  while (std::getline (ps, pl))
+    {
+      vector<string> f = split (pl, '\t');
+      if (f.size () >= 4)
+	{
+	  Json::Value e;
+	  e["node"] = f[0];
+	  e["path"] = f[1];
+	  e["reason"] = f[2];
+	  e["detail"] = f[3];
+	  pf.append (e);
+	}
+    }
+  response["preflight_failures"] = pf;
+
   Json::Value steps (Json::arrayValue);
   std::istringstream ss (state_of (dir, "steps"));
   string line;

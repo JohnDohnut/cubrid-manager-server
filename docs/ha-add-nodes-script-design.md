@@ -424,7 +424,7 @@ CMS에 HA 단계를 두지 않는 구조로 의존성을 대부분 없앰. 남�
 |---|---|---|---|
 | `ha_check_ssh` | 동기(최대 약 20초) | 이전과 같음(`host`, `ssh_port`, `os_user`, `os_password`, `hostkey_sha256`) | 이전과 같음. 내부는 `cm_ssh hostkey`, `cm_ssh check`(일회용 헬퍼) |
 | `ha_add_nodes` | 비동기 | 3.1의 JSON. `cleanup`·`rollback`은 `uuid` + 필요한 노드의 접속 정보·비밀번호 | `uuid`, `job_status`=`running` |
-| `ha_add_nodes_status` | 동기 | `uuid`, `offset` | `job_status`, `phase`, `step_no`, `step_count`, `steps[]`(`id`, `no`, `title`, `node`, `db`, `state`, `detail`), `nodes[]`(`host`, `role`, `new`), `plan`(plan일 때), `output`, `next_offset`, `error`, `message`, `downtime_sec`, `kept_db_paths`, `unrestored[]`(`node`, `kind`, `path`: 되돌리지 못한 항목, 9.4) |
+| `ha_add_nodes_status` | 동기 | `uuid`, `offset` | `job_status`, `phase`, `step_no`, `step_count`, `steps[]`(`id`, `no`, `title`, `node`, `db`, `state`, `detail`), `nodes[]`(`host`, `role`, `new`), `plan`(plan일 때), `output`, `next_offset`, `error`, `message`, `downtime_sec`, `kept_db_paths`, `unrestored[]`(`node`, `kind`, `path`: 되돌리지 못한 항목, 9.4), `preflight_failures[]`(`node`, `path`, `reason`=`not_writable`/`no_room`/`cannot_create`/`transfer_failed`, `detail`: S3 사전 점검이 찾은 것) |
 | `ha_add_nodes_cancel` | 동기 | `uuid` | `job_status` |
 
 - `plan` 결과(상태 응답의 `plan`)

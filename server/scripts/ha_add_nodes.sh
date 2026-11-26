@@ -833,35 +833,64 @@ st_node_check() {   # st_node_check <host> <existing|new> <role>
 
 # ------------------------------------------------ S3 preflight: what the later steps write is tried first
 
+# each failure also goes to the job folder as "node<TAB>path<TAB>reason<TAB>detail" (preflight_failures in the status;
+# reason: not_writable, no_room, cannot_create, transfer_failed) so the screen does not have to parse the message
+pf_note() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(one_line "$4")" >> "$JOB_DIR/preflight_failures"; }
+
 st_preflight() {   # <host>: L tries its backup folder; a new node its receiving folder (a small transfer),
                    # the folders the restore writes to and the replication log folder
-  local h=$1 db need=0 sz p r
+  local h=$1 db need=0 p r bad=0 path anc st
   if [ "$h" = "$L" ]; then
     on_node "$L" 30 0 writable "$BK_PATH"
-    [[ $OUT == OK* ]] || { fail precheck_failed "cannot write $BK_PATH ($(one_line "$OUT"))"; return 1; }
+    if [[ $OUT != OK* ]]; then
+      read -r _ path anc <<< "$OUT"
+      pf_note "$L" "$BK_PATH" not_writable "${anc:-$OUT} is not writable"
+      fail precheck_failed "cannot write $BK_PATH ($(one_line "$OUT"))"
+      return 1
+    fi
     return 0
   fi
   r=$(rbk_root "$h")
-  local paths=("$r" "${N_HOME[$h]}")
-  for db in "${D[@]}"; do paths+=("${NV[$h/$db]}" "${NLG[$h/$db]}"); done
+  local paths=() x
+  for x in "$r" "${N_HOME[$h]}" $(for db in "${D[@]}"; do printf '%s %s ' "${NV[$h/$db]}" "${NLG[$h/$db]}"; done); do
+    [[ " ${paths[*]} " == *" $x "* ]] || paths+=("$x")
+  done
   on_node "$h" 30 0 writable "${paths[@]}"
-  if [[ $OUT == *"NO "* ]]; then
-    fail precheck_failed "$h cannot write: $(printf '%s\n' "$OUT" | awk '$1 == "NO" { printf "%s (%s is not writable) ", $2, $3 }')"
+  local wout=$OUT
+  while read -r st path anc; do
+    [ "$st" = NO ] || continue
+    pf_note "$h" "$path" not_writable "$anc is not writable"
+    bad=1
+  done <<< "$wout"
+  if [ $bad = 1 ]; then
+    fail precheck_failed "$h cannot write: $(printf '%s\n' "$wout" | awk '$1 == "NO" { printf "%s (%s is not writable) ", $2, $3 }')"
     return 1
   fi
   # room: the backup arrives, then the restore writes about the same again
   need=$(( ${JOB[backup_bytes]:-0} ))
-  p=$(printf '%s\n' "$OUT" | awk -v r="$r" '$1 == "OK" && $2 == r { print $3 }')
-  [ "${p:-0}" -gt "$need" ] || { fail precheck_failed "$h: not enough room for the backup under $r (${p:-0} bytes free, about $need needed)"; return 1; }
+  p=$(printf '%s\n' "$wout" | awk -v r="$r" '$1 == "OK" && $2 == r { print $3 }')
+  if [ "${p:-0}" -le "$need" ]; then
+    pf_note "$h" "$r" no_room "${p:-0} bytes free, about $need needed"
+    fail precheck_failed "$h: not enough room for the backup under $r (${p:-0} bytes free, about $need needed)"
+    return 1
+  fi
   # a small transfer into a folder of its own, removed again
   local t="$r/$TAG.preflight" made=0
   on_node "$h" 30 0 exists "$r"; [[ $OUT == *"MISSING"* ]] && made=1
-  on_node "$h" 30 0 mkdir "$t" || { fail transfer_failed "$h: cannot create $t"; return 1; }
+  if ! on_node "$h" 30 0 mkdir "$t"; then
+    pf_note "$h" "$t" cannot_create "$OUT"
+    fail transfer_failed "$h: cannot create $t"
+    return 1
+  fi
   run_bg 120 1 "$CM_SSH" put --agent "$AGENT" "$h" "$SELF" "$t/transfer-test"
   local prc=$RC pout=$OUT
   on_node "$h" 30 0 remove "$t"
   [ $made = 1 ] && on_node "$h" 30 0 rmdir_empty "$r"
-  [ "$prc" -eq 0 ] || { fail transfer_failed "$h: a test transfer failed: $(printf '%s' "$pout" | grep '^cm_ssh: ' | tail -1)"; return 1; }
+  if [ "$prc" -ne 0 ]; then
+    pf_note "$h" "$t" transfer_failed "$(printf '%s' "$pout" | grep '^cm_ssh: ' | tail -1)"
+    fail transfer_failed "$h: a test transfer failed: $(printf '%s' "$pout" | grep '^cm_ssh: ' | tail -1)"
+    return 1
+  fi
   return 0
 }
 
